@@ -33,6 +33,28 @@ pip install goldenverba
 - [💖 Open Source Contribution](#open-source-contribution)
 - [🚩 Known Issues](#known-issues)
 - [❔FAQ](#faq)
+- [📚 Documentation](#documentation)
+
+## Documentation
+
+### 📖 Comprehensive Guides
+
+For developers and contributors looking to understand Verba's architecture and implementation:
+
+- **[Codebase Guide](./VERBA_CODEBASE_GUIDE.md)** - Complete technical overview of Verba's architecture, including:
+  - System architecture and component breakdown
+  - Data flow diagrams for document import and RAG pipelines
+  - Detailed explanation of all 5 component types (Reader, Chunker, Embedder, Retriever, Generator)
+  - Configuration system and deployment options
+  - Extension points for adding new functionality
+
+- **[UI & Implementation Guide](./VERBA_UI_AND_IMPLEMENTATION_GUIDE.md)** - In-depth guide to the user interface and core implementations:
+  - Complete UI component documentation with button functions and interactions
+  - Two-panel chat interface explained in detail
+  - Retriever implementation walkthrough (WindowRetriever with code examples)
+  - Generator implementation examples (OpenAI, Anthropic, and others)
+  - WebSocket communication patterns
+  - Complete data flow from user query to AI response
 
 ## What Is Verba?
 
