@@ -37,6 +37,7 @@ from goldenverba.server.types import (
     GetVectorPayload,
     DataBatchPayload,
     ChunksPayload,
+    FeedbackPayload,
 )
 
 load_dotenv()
@@ -729,6 +730,106 @@ async def get_meta(payload: Credentials):
                 "error": f"Couldn't retrieve metadata {str(e)}",
                 "node_payload": {},
                 "collection_payload": {},
+            }
+        )
+
+
+### FEEDBACK ENDPOINTS
+
+
+@app.post("/api/submit_feedback")
+async def submit_feedback(payload: FeedbackPayload):
+    """
+    Submit user feedback linked to a specific trace ID.
+    
+    Args:
+        payload: FeedbackPayload containing trace_id, rating, and optional feedback
+        
+    Returns:
+        JSONResponse with success status and feedback correlation information
+    """
+    try:
+        # Validate rating range (1-5 scale)
+        if not (1.0 <= payload.rating <= 5.0):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Rating must be between 1.0 and 5.0",
+                    "feedback_recorded": False
+                }
+            )
+        
+        # Validate trace_id format (basic validation)
+        if not payload.trace_id or len(payload.trace_id.strip()) == 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "trace_id is required and cannot be empty",
+                    "feedback_recorded": False
+                }
+            )
+        
+        # Connect to client for potential future feedback storage
+        client = await client_manager.connect(payload.credentials)
+        
+        # Record feedback using observability module with enhanced correlation
+        from goldenverba.observability import record_feedback, create_feedback_span
+        
+        # Create both standard feedback record and enhanced Phoenix-optimized span
+        feedback_recorded = record_feedback(
+            trace_id=payload.trace_id,
+            rating=payload.rating,
+            feedback_tag=payload.feedback_tag,
+            comments=payload.comments
+        )
+        
+        # Create enhanced feedback span for better Phoenix correlation
+        enhanced_span_created = create_feedback_span(
+            trace_id=payload.trace_id,
+            rating=payload.rating,
+            feedback_tag=payload.feedback_tag,
+            comments=payload.comments
+        )
+        
+        if feedback_recorded and enhanced_span_created:
+            msg.good(f"Feedback recorded for trace {payload.trace_id}: rating={payload.rating}")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "feedback_recorded": True,
+                    "enhanced_correlation": True,
+                    "trace_id": payload.trace_id,
+                    "message": "Feedback successfully recorded and linked to trace with enhanced correlation"
+                }
+            )
+        elif feedback_recorded:
+            msg.good(f"Feedback recorded for trace {payload.trace_id}: rating={payload.rating} (basic correlation)")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "feedback_recorded": True,
+                    "enhanced_correlation": False,
+                    "trace_id": payload.trace_id,
+                    "message": "Feedback recorded with basic correlation"
+                }
+            )
+        else:
+            msg.warn(f"Failed to record feedback for trace {payload.trace_id}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "Failed to record feedback in tracing system",
+                    "feedback_recorded": False
+                }
+            )
+            
+    except Exception as e:
+        msg.fail(f"Feedback submission failed: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"Feedback submission failed: {str(e)}",
+                "feedback_recorded": False
             }
         )
 

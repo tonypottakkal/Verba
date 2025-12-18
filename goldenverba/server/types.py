@@ -259,3 +259,11 @@ class GetDocumentPayload(BaseModel):
 class ResetPayload(BaseModel):
     resetMode: str
     credentials: Credentials
+
+
+class FeedbackPayload(BaseModel):
+    trace_id: str
+    rating: float
+    feedback_tag: Optional[str] = None
+    comments: Optional[str] = None
+    credentials: Credentials
