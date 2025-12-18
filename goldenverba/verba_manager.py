@@ -720,27 +720,72 @@ class VerbaManager:
         rag_config: dict,
         labels: list[str] = [],
         document_uuids: list[str] = [],
+        user_session_id: str = None,
     ):
-        retriever = rag_config["Retriever"].selected
-        embedder = rag_config["Embedder"].selected
+        from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error, create_experiment_context
+        
+        tracer = get_tracer()
+        
+        with tracer.start_as_current_span("rag.query") as span:
+            try:
+                # Attach query characteristics and configuration attributes
+                query_attributes = {
+                    "rag.query_chars": len(query),
+                    "rag.model": rag_config["Generator"].selected,
+                    "rag.embed_model": rag_config["Embedder"].selected,
+                    "rag.top_k": rag_config["Retriever"].components.get(
+                        rag_config["Retriever"].selected, {}
+                    ).get("config", {}).get("top_k", {}).get("value", 10),
+                    "rag.index": "verba_documents"
+                }
+                
+                # Add experiment tracking if session ID provided
+                if user_session_id:
+                    experiment_context = create_experiment_context(user_session_id)
+                    query_attributes.update(experiment_context)
+                    
+                    # Add configuration version attributes
+                    query_attributes.update({
+                        "config.prompt_version": "v3.2",  # Default version
+                        "config.reranker_version": rag_config.get("Retriever", {}).get("selected", "default")
+                    })
+                
+                attach_rag_attributes(span, query_attributes)
+                
+                retriever = rag_config["Retriever"].selected
+                embedder = rag_config["Embedder"].selected
 
-        await self.weaviate_manager.add_suggestion(client, query)
+                await self.weaviate_manager.add_suggestion(client, query)
 
-        vector = await self.embedder_manager.vectorize_query(
-            embedder, query, rag_config
-        )
-        documents, context = await self.retriever_manager.retrieve(
-            client,
-            retriever,
-            query,
-            vector,
-            rag_config,
-            self.weaviate_manager,
-            labels,
-            document_uuids,
-        )
+                vector = await self.embedder_manager.vectorize_query(
+                    embedder, query, rag_config
+                )
+                documents, context = await self.retriever_manager.retrieve(
+                    client,
+                    retriever,
+                    query,
+                    vector,
+                    rag_config,
+                    self.weaviate_manager,
+                    labels,
+                    document_uuids,
+                )
 
-        return (documents, context)
+                # Attach retrieval results attributes
+                result_attributes = {
+                    "rag.retrieved_docs_count": len(documents),
+                    "rag.context_chars": len(context),
+                    "rag.success": True
+                }
+                attach_rag_attributes(span, result_attributes)
+
+                return (documents, context)
+                
+            except Exception as e:
+                handle_span_error(span, e)
+                # Attach failure attribute
+                span.set_attribute("rag.success", False)
+                raise
 
     async def generate_stream_answer(
         self,
@@ -748,14 +793,65 @@ class VerbaManager:
         query: str,
         context: str,
         conversation: list[dict],
+        user_session_id: str = None,
     ):
+        from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+        
+        tracer = get_tracer()
+        
+        with tracer.start_as_current_span("rag.generate") as span:
+            try:
+                # Attach generation attributes
+                generation_attributes = {
+                    "rag.model": rag_config["Generator"].selected,
+                    "rag.streaming": True,
+                    "rag.prompt_tokens": len(query) + len(context),  # Approximate token count
+                }
+                
+                # Add experiment tracking if session ID provided
+                if user_session_id:
+                    from goldenverba.observability import create_experiment_context
+                    experiment_context = create_experiment_context(user_session_id)
+                    generation_attributes.update(experiment_context)
+                    
+                    # Add configuration version attributes
+                    generation_attributes.update({
+                        "config.prompt_version": "v3.2",  # Default version
+                        "config.reranker_version": rag_config.get("Retriever", {}).get("selected", "default")
+                    })
+                
+                # Add model-specific configuration if available
+                generator_config = rag_config["Generator"].components.get(
+                    rag_config["Generator"].selected, {}
+                ).get("config", {})
+                
+                if "temperature" in generator_config:
+                    generation_attributes["llm.temperature"] = generator_config["temperature"].get("value", 0.7)
+                
+                attach_rag_attributes(span, generation_attributes)
 
-        full_text = ""
-        async for result in self.generator_manager.generate_stream(
-            rag_config, query, context, conversation
-        ):
-            full_text += result["message"]
-            yield result
+                full_text = ""
+                completion_tokens = 0
+                
+                async for result in self.generator_manager.generate_stream(
+                    rag_config, query, context, conversation
+                ):
+                    full_text += result["message"]
+                    completion_tokens += len(result["message"].split())  # Approximate token count
+                    yield result
+                
+                # Attach final metrics after streaming completes
+                final_attributes = {
+                    "rag.completion_tokens": completion_tokens,
+                    "rag.total_tokens": generation_attributes["rag.prompt_tokens"] + completion_tokens,
+                    "rag.success": True
+                }
+                attach_rag_attributes(span, final_attributes)
+                
+            except Exception as e:
+                handle_span_error(span, e)
+                span.set_attribute("rag.success", False)
+                raise
 
 
 class ClientManager:

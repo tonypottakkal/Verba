@@ -217,6 +217,7 @@ async def websocket_generate_stream(websocket: WebSocket):
                 payload.query,
                 payload.context,
                 payload.conversation,
+                user_session_id=payload.session_id,
             ):
                 full_text += chunk["message"]
                 if chunk["finish_reason"] == "stop":
@@ -428,7 +429,8 @@ async def query(payload: QueryPayload):
         client = await client_manager.connect(payload.credentials)
         documents_uuid = [document.uuid for document in payload.documentFilter]
         documents, context = await manager.retrieve_chunks(
-            client, payload.query, payload.RAG, payload.labels, documents_uuid
+            client, payload.query, payload.RAG, payload.labels, documents_uuid,
+            user_session_id=payload.session_id
         )
 
         return JSONResponse(

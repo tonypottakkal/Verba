@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel
 from enum import Enum
 
@@ -188,6 +188,7 @@ class QueryPayload(BaseModel):
     labels: list[str]
     documentFilter: list[DocumentFilter]
     credentials: Credentials
+    session_id: Optional[str] = None
 
 
 class DatacountPayload(BaseModel):
@@ -231,6 +232,7 @@ class GeneratePayload(BaseModel):
     context: str
     conversation: list[ConversationItem]
     rag_config: dict[str, RAGComponentClass]
+    session_id: Optional[str] = None
 
 
 class ConfigPayload(BaseModel):

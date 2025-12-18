@@ -789,44 +789,156 @@ class WeaviateManager:
             else:
                 apply_filters = None
 
-            if limit_mode == "Autocut":
-                chunks = await embedder_collection.query.hybrid(
-                    query=query,
-                    vector=vector,
-                    alpha=0.5,
-                    auto_limit=limit,
-                    return_metadata=MetadataQuery(score=True, explain_score=False),
-                    filters=apply_filters,
-                )
-            else:
-                chunks = await embedder_collection.query.hybrid(
-                    query=query,
-                    vector=vector,
-                    alpha=0.5,
-                    limit=limit,
-                    return_metadata=MetadataQuery(score=True, explain_score=False),
-                    filters=apply_filters,
-                )
-
-            return chunks.objects
+            # Instrument Weaviate hybrid search operation
+            try:
+                from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+                import time
+                
+                tracer = get_tracer()
+                
+                with tracer.start_as_current_span("weaviate.hybrid_search") as span:
+                    try:
+                        start_time = time.time()
+                        
+                        # Attach Weaviate operation attributes
+                        weaviate_attributes = {
+                            "weaviate.collection": self.embedding_table[embedder],
+                            "weaviate.query_type": "hybrid",
+                            "weaviate.query_chars": len(query),
+                            "weaviate.vector_dimensions": len(vector),
+                            "weaviate.limit_mode": limit_mode,
+                            "weaviate.limit": limit,
+                            "weaviate.labels_count": len(labels),
+                            "weaviate.document_filter_count": len(document_uuids),
+                            "weaviate.alpha": 0.5
+                        }
+                        
+                        attach_rag_attributes(span, weaviate_attributes)
+                        
+                        if limit_mode == "Autocut":
+                            chunks = await embedder_collection.query.hybrid(
+                                query=query,
+                                vector=vector,
+                                alpha=0.5,
+                                auto_limit=limit,
+                                return_metadata=MetadataQuery(score=True, explain_score=False),
+                                filters=apply_filters,
+                            )
+                        else:
+                            chunks = await embedder_collection.query.hybrid(
+                                query=query,
+                                vector=vector,
+                                alpha=0.5,
+                                limit=limit,
+                                return_metadata=MetadataQuery(score=True, explain_score=False),
+                                filters=apply_filters,
+                            )
+                        
+                        # Attach result attributes
+                        end_time = time.time()
+                        result_attributes = {
+                            "weaviate.response_time_ms": round((end_time - start_time) * 1000, 2),
+                            "weaviate.results_count": len(chunks.objects),
+                            "weaviate.success": True
+                        }
+                        attach_rag_attributes(span, result_attributes)
+                        
+                        return chunks.objects
+                        
+                    except Exception as e:
+                        handle_span_error(span, e)
+                        span.set_attribute("weaviate.success", False)
+                        raise
+                        
+            except ImportError:
+                # Fallback if observability is not available
+                if limit_mode == "Autocut":
+                    chunks = await embedder_collection.query.hybrid(
+                        query=query,
+                        vector=vector,
+                        alpha=0.5,
+                        auto_limit=limit,
+                        return_metadata=MetadataQuery(score=True, explain_score=False),
+                        filters=apply_filters,
+                    )
+                else:
+                    chunks = await embedder_collection.query.hybrid(
+                        query=query,
+                        vector=vector,
+                        alpha=0.5,
+                        limit=limit,
+                        return_metadata=MetadataQuery(score=True, explain_score=False),
+                        filters=apply_filters,
+                    )
+                
+                return chunks.objects
 
     async def get_chunk_by_ids(
         self, client: WeaviateAsyncClient, embedder: str, doc_uuid: str, ids: list[int]
     ):
         if await self.verify_embedding_collection(client, embedder):
             embedder_collection = client.collections.get(self.embedding_table[embedder])
+            
+            # Instrument Weaviate fetch operation
             try:
-                weaviate_chunks = await embedder_collection.query.fetch_objects(
-                    filters=(
-                        Filter.by_property("doc_uuid").equal(str(doc_uuid))
-                        & Filter.by_property("chunk_id").contains_any(list(ids))
-                    ),
-                    sort=Sort.by_property("chunk_id", ascending=True),
-                )
-                return weaviate_chunks.objects
-            except Exception as e:
-                msg.fail(f"Failed to fetch chunks: {str(e)}")
-                raise e
+                from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+                import time
+                
+                tracer = get_tracer()
+                
+                with tracer.start_as_current_span("weaviate.fetch_chunks") as span:
+                    try:
+                        start_time = time.time()
+                        
+                        # Attach Weaviate operation attributes
+                        weaviate_attributes = {
+                            "weaviate.collection": self.embedding_table[embedder],
+                            "weaviate.query_type": "fetch_objects",
+                            "weaviate.doc_uuid": str(doc_uuid),
+                            "weaviate.chunk_ids_count": len(ids),
+                        }
+                        
+                        attach_rag_attributes(span, weaviate_attributes)
+                        
+                        weaviate_chunks = await embedder_collection.query.fetch_objects(
+                            filters=(
+                                Filter.by_property("doc_uuid").equal(str(doc_uuid))
+                                & Filter.by_property("chunk_id").contains_any(list(ids))
+                            ),
+                            sort=Sort.by_property("chunk_id", ascending=True),
+                        )
+                        
+                        # Attach result attributes
+                        end_time = time.time()
+                        result_attributes = {
+                            "weaviate.response_time_ms": round((end_time - start_time) * 1000, 2),
+                            "weaviate.results_count": len(weaviate_chunks.objects),
+                            "weaviate.success": True
+                        }
+                        attach_rag_attributes(span, result_attributes)
+                        
+                        return weaviate_chunks.objects
+                        
+                    except Exception as e:
+                        handle_span_error(span, e)
+                        span.set_attribute("weaviate.success", False)
+                        msg.fail(f"Failed to fetch chunks: {str(e)}")
+                        raise e
+                        
+            except ImportError:
+                # Fallback if observability is not available
+                try:
+                    weaviate_chunks = await embedder_collection.query.fetch_objects(
+                        filters=(
+                            Filter.by_property("doc_uuid").equal(str(doc_uuid))
+                            & Filter.by_property("chunk_id").contains_any(list(ids))
+                        ),
+                        sort=Sort.by_property("chunk_id", ascending=True),
+                    )
+                    return weaviate_chunks.objects
+                except Exception as e:
+                    msg.fail(f"Failed to fetch chunks: {str(e)}")
+                    raise e
 
     ### Suggestion Logic
 
@@ -1162,12 +1274,54 @@ class EmbeddingManager:
         self, embedder: str, content: str, rag_config: dict
     ) -> list[float]:
         try:
-            if embedder in self.embedders:
-                config = rag_config["Embedder"].components[embedder].config
-                embeddings = await self.embedders[embedder].vectorize(config, [content])
-                return embeddings[0]
-            else:
-                raise Exception(f"{embedder} Embedder not found")
+            from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+            import time
+            
+            tracer = get_tracer()
+            
+            with tracer.start_as_current_span("embedding.vectorize_query") as span:
+                try:
+                    start_time = time.time()
+                    
+                    if embedder in self.embedders:
+                        config = rag_config["Embedder"].components[embedder].config
+                        
+                        # Attach embedding attributes
+                        embedding_attributes = {
+                            "embedding.model": embedder,
+                            "embedding.input_chars": len(content),
+                            "embedding.input_tokens": len(content.split()),  # Approximate token count
+                        }
+                        
+                        # Add model-specific configuration
+                        if "Model" in config:
+                            embedding_attributes["embedding.model_name"] = config["Model"].value
+                        
+                        attach_rag_attributes(span, embedding_attributes)
+                        
+                        embeddings = await self.embedders[embedder].vectorize(config, [content])
+                        
+                        # Attach result attributes
+                        end_time = time.time()
+                        result_attributes = {
+                            "embedding.latency_ms": round((end_time - start_time) * 1000, 2),
+                            "embedding.vector_dimensions": len(embeddings[0]) if embeddings else 0,
+                            "embedding.success": True
+                        }
+                        attach_rag_attributes(span, result_attributes)
+                        
+                        return embeddings[0]
+                    else:
+                        error = Exception(f"{embedder} Embedder not found")
+                        handle_span_error(span, error)
+                        span.set_attribute("embedding.success", False)
+                        raise error
+                        
+                except Exception as e:
+                    handle_span_error(span, e)
+                    span.set_attribute("embedding.success", False)
+                    raise
+                    
         except Exception as e:
             raise e
 
@@ -1190,27 +1344,74 @@ class RetrieverManager:
         document_uuids: list[str],
     ):
         try:
-            if retriever not in self.retrievers:
-                raise Exception(f"Retriever {retriever} not found")
+            from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+            import time
+            
+            tracer = get_tracer()
+            
+            with tracer.start_as_current_span("rag.retrieve") as span:
+                try:
+                    start_time = time.time()
+                    
+                    if retriever not in self.retrievers:
+                        error = Exception(f"Retriever {retriever} not found")
+                        handle_span_error(span, error)
+                        span.set_attribute("rag.success", False)
+                        raise error
 
-            embedder_model = (
-                rag_config["Embedder"]
-                .components[rag_config["Embedder"].selected]
-                .config["Model"]
-                .value
-            )
-            config = rag_config["Retriever"].components[retriever].config
-            documents, context = await self.retrievers[retriever].retrieve(
-                client,
-                query,
-                vector,
-                config,
-                weaviate_manager,
-                embedder_model,
-                labels,
-                document_uuids,
-            )
-            return (documents, context)
+                    embedder_model = (
+                        rag_config["Embedder"]
+                        .components[rag_config["Embedder"].selected]
+                        .config["Model"]
+                        .value
+                    )
+                    config = rag_config["Retriever"].components[retriever].config
+                    
+                    # Attach retrieval attributes
+                    retrieval_attributes = {
+                        "rag.retriever": retriever,
+                        "rag.embed_model": embedder_model,
+                        "rag.query_chars": len(query),
+                        "rag.vector_dimensions": len(vector),
+                        "rag.labels_count": len(labels),
+                        "rag.document_filter_count": len(document_uuids),
+                    }
+                    
+                    # Add retrieval parameters from config
+                    if "top_k" in config:
+                        retrieval_attributes["rag.top_k"] = config["top_k"].value
+                    if "alpha" in config:
+                        retrieval_attributes["rag.alpha"] = config["alpha"].value
+                    
+                    attach_rag_attributes(span, retrieval_attributes)
+                    
+                    documents, context = await self.retrievers[retriever].retrieve(
+                        client,
+                        query,
+                        vector,
+                        config,
+                        weaviate_manager,
+                        embedder_model,
+                        labels,
+                        document_uuids,
+                    )
+                    
+                    # Attach result attributes
+                    end_time = time.time()
+                    result_attributes = {
+                        "rag.retrieved_docs_count": len(documents),
+                        "rag.context_chars": len(context),
+                        "rag.retrieval_latency_ms": round((end_time - start_time) * 1000, 2),
+                        "rag.success": True
+                    }
+                    attach_rag_attributes(span, result_attributes)
+                    
+                    return (documents, context)
+                    
+                except Exception as e:
+                    handle_span_error(span, e)
+                    span.set_attribute("rag.success", False)
+                    raise
 
         except Exception as e:
             raise e
@@ -1238,10 +1439,69 @@ class GeneratorManager:
         if generator not in self.generators:
             raise Exception(f"Generator {generator} not found")
 
-        async for result in self.generators[generator].generate_stream(
-            generator_config, query, context, conversation
-        ):
-            yield result
+        # Instrument generation with tracing
+        try:
+            from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
+            import time
+            
+            tracer = get_tracer()
+            
+            with tracer.start_as_current_span("generation.stream") as span:
+                try:
+                    start_time = time.time()
+                    
+                    # Attach generation attributes
+                    generation_attributes = {
+                        "generation.model": generator,
+                        "generation.streaming": True,
+                        "generation.query_chars": len(query),
+                        "generation.context_chars": len(context),
+                        "generation.conversation_length": len(conversation) if conversation else 0,
+                    }
+                    
+                    # Add model-specific configuration
+                    if "temperature" in generator_config:
+                        generation_attributes["generation.temperature"] = generator_config["temperature"].get("value", 0.7)
+                    if "max_tokens" in generator_config:
+                        generation_attributes["generation.max_tokens"] = generator_config["max_tokens"].get("value", 1000)
+                    if "model" in generator_config:
+                        generation_attributes["generation.model_name"] = generator_config["model"].get("value", generator)
+                    
+                    attach_rag_attributes(span, generation_attributes)
+                    
+                    # Track streaming metrics
+                    total_tokens = 0
+                    response_count = 0
+                    
+                    async for result in self.generators[generator].generate_stream(
+                        generator_config, query, context, conversation
+                    ):
+                        if "message" in result:
+                            total_tokens += len(result["message"].split())  # Approximate token count
+                            response_count += 1
+                        yield result
+                    
+                    # Attach final metrics after streaming completes
+                    end_time = time.time()
+                    final_attributes = {
+                        "generation.completion_tokens": total_tokens,
+                        "generation.response_count": response_count,
+                        "generation.latency_ms": round((end_time - start_time) * 1000, 2),
+                        "generation.success": True
+                    }
+                    attach_rag_attributes(span, final_attributes)
+                    
+                except Exception as e:
+                    handle_span_error(span, e)
+                    span.set_attribute("generation.success", False)
+                    raise
+                    
+        except ImportError:
+            # Fallback if observability is not available
+            async for result in self.generators[generator].generate_stream(
+                generator_config, query, context, conversation
+            ):
+                yield result
 
     def truncate_conversation_dicts(
         self, conversation_dicts: list[dict[str, any]], max_tokens: int
