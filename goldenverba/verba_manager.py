@@ -30,6 +30,7 @@ from goldenverba.components.managers import (
     GeneratorManager,
     WeaviateManager,
 )
+from goldenverba.observability import setup_tracing
 
 load_dotenv()
 
@@ -38,6 +39,16 @@ class VerbaManager:
     """Manages all Verba Components."""
 
     def __init__(self) -> None:
+        # Initialize tracing before any component instantiation
+        try:
+            tracing_success = setup_tracing()
+            if tracing_success:
+                msg.good("OpenTelemetry tracing initialized successfully")
+            else:
+                msg.warn("OpenTelemetry tracing initialization failed, continuing without tracing")
+        except Exception as e:
+            msg.warn(f"Tracing setup error: {str(e)}, continuing without tracing")
+
         self.reader_manager = ReaderManager()
         self.chunker_manager = ChunkerManager()
         self.embedder_manager = EmbeddingManager()
