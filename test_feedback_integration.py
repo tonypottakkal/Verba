@@ -75,6 +75,9 @@ def test_feedback_span_creation():
         print("✓ Enhanced feedback span creation test passed")
 
 
+import pytest
+
+@pytest.mark.asyncio
 async def test_feedback_api_endpoint():
     """Test the feedback API endpoint functionality."""
     from goldenverba.server.types import FeedbackPayload, Credentials
