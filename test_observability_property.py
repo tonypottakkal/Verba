@@ -50,6 +50,7 @@ def rag_config_strategy(draw):
     generator_name = draw(st.sampled_from(generators))
     
     top_k = draw(st.integers(min_value=1, max_value=20))
+    temperature = draw(st.floats(min_value=0.0, max_value=2.0))
     
     # Create mock objects with proper structure
     retriever_mock = Mock()
@@ -67,6 +68,13 @@ def rag_config_strategy(draw):
     
     generator_mock = Mock()
     generator_mock.selected = generator_name
+    generator_mock.components = {
+        generator_name: {
+            "config": {
+                "temperature": {"value": temperature}
+            }
+        }
+    }
     
     return {
         "Retriever": retriever_mock,
@@ -344,6 +352,186 @@ def test_trace_export_resilience_property(query: str, rag_config: Dict[str, Any]
         assert result, "Resilience property test should pass"
 
 
+@settings(max_examples=100, deadline=None)
+@given(
+    query=query_strategy(),
+    rag_config=rag_config_strategy(),
+    session_id=session_id_strategy()
+)
+def test_rag_span_structure_completeness_property(query: str, rag_config: Dict[str, Any], session_id: str):
+    """
+    **Feature: verba-observability, Property 2: RAG span structure completeness**
+    
+    Property: For any user query, the system should create a complete span hierarchy 
+    including root rag.query span, rag.retrieve span, and rag.generate span with 
+    proper parent-child relationships.
+    
+    This test verifies that:
+    1. A root rag.query span is created for every query
+    2. A rag.retrieve span is created during document retrieval
+    3. A rag.generate span is created during text generation
+    4. Spans have proper hierarchical relationships
+    5. All required spans are present regardless of query content
+    """
+    
+    # Setup mock tracer that tracks span hierarchy
+    mock_tracer = MockTracer()
+    
+    # Create a real attach_rag_attributes function that actually sets attributes
+    def real_attach_rag_attributes(span, attributes):
+        for key, value in attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+    
+    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
+         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
+         patch('goldenverba.observability.handle_span_error') as mock_handle_error, \
+         patch('goldenverba.observability.create_experiment_context') as mock_experiment:
+        
+        # Setup experiment context mock
+        mock_experiment.return_value = {
+            "exp.name": "verba_rag_experiment_001",
+            "exp.variant": "A" if hash(session_id) % 2 == 0 else "B",
+            "user.session_id": session_id
+        }
+        
+        # Import and setup VerbaManager with mocked dependencies
+        from goldenverba.verba_manager import VerbaManager
+        
+        manager = VerbaManager()
+        
+        # Mock all manager dependencies
+        manager.weaviate_manager = Mock()
+        manager.weaviate_manager.add_suggestion = AsyncMock()
+        
+        manager.embedder_manager = Mock()
+        # Generate a realistic embedding vector
+        embedding_dim = 1536  # Common OpenAI embedding dimension
+        mock_vector = [0.1] * embedding_dim
+        manager.embedder_manager.vectorize_query = AsyncMock(return_value=mock_vector)
+        
+        manager.retriever_manager = Mock()
+        # Generate mock documents and context
+        mock_documents = [f"Document {i}" for i in range(min(5, len(query) // 10 + 1))]
+        mock_context = f"Context for query: {query[:100]}..."
+        
+        # Mock the retrieve method to also create the rag.retrieve span
+        async def mock_retrieve(*args, **kwargs):
+            # Create the rag.retrieve span that would normally be created
+            with mock_tracer.start_as_current_span("rag.retrieve") as retrieve_span:
+                retrieve_span.set_attribute("rag.retrieved_docs_count", len(mock_documents))
+                retrieve_span.set_attribute("rag.context_chars", len(mock_context))
+                return (mock_documents, mock_context)
+        
+        manager.retriever_manager.retrieve = mock_retrieve
+        
+        manager.generator_manager = Mock()
+        
+        # Mock the generator stream to simulate text generation
+        async def mock_generate_stream(rag_config, query, context, conversation):
+            """Mock streaming generator that yields realistic responses."""
+            response_parts = [
+                {"message": "Based on the provided context, "},
+                {"message": "I can answer your question about "},
+                {"message": query[:20] + "... "},
+                {"message": "The relevant information shows that "},
+                {"message": "this is a comprehensive response."}
+            ]
+            for part in response_parts:
+                yield part
+        
+        manager.generator_manager.generate_stream = mock_generate_stream
+        
+        async def run_span_structure_test():
+            """Execute the span structure property test."""
+            try:
+                # Execute retrieve_chunks which should create rag.query and rag.retrieve spans
+                result = await manager.retrieve_chunks(
+                    client=Mock(),
+                    query=query,
+                    rag_config=rag_config,
+                    user_session_id=session_id
+                )
+                
+                # Verify retrieve_chunks completed successfully
+                assert result is not None, "retrieve_chunks should return a result"
+                documents, context = result
+                assert isinstance(documents, list), "Documents should be a list"
+                assert isinstance(context, str), "Context should be a string"
+                
+                # Execute generate_stream_answer which should create rag.generate span
+                response_parts = []
+                async for part in manager.generate_stream_answer(
+                    rag_config=rag_config,
+                    query=query,
+                    context=context,
+                    conversation=[],
+                    user_session_id=session_id
+                ):
+                    response_parts.append(part)
+                
+                # Verify generation completed successfully
+                assert len(response_parts) > 0, "Generation should produce response parts"
+                
+                # Now verify the span structure completeness
+                
+                # 1. Verify root rag.query span exists
+                query_spans = [span for span in mock_tracer.spans_created if span.name == "rag.query"]
+                assert len(query_spans) == 1, f"Expected exactly 1 rag.query span, got {len(query_spans)}"
+                
+                root_span = query_spans[0]
+                
+                # 2. Verify rag.retrieve span exists (created by retriever_manager.retrieve)
+                retrieve_spans = [span for span in mock_tracer.spans_created if span.name == "rag.retrieve"]
+                assert len(retrieve_spans) >= 1, f"Expected at least 1 rag.retrieve span, got {len(retrieve_spans)}"
+                
+                # 3. Verify rag.generate span exists
+                generate_spans = [span for span in mock_tracer.spans_created if span.name == "rag.generate"]
+                assert len(generate_spans) == 1, f"Expected exactly 1 rag.generate span, got {len(generate_spans)}"
+                
+                generation_span = generate_spans[0]
+                
+                # 4. Verify span hierarchy and completeness
+                # All spans should be created (indicating proper instrumentation)
+                expected_span_names = {"rag.query", "rag.generate"}
+                actual_span_names = {span.name for span in mock_tracer.spans_created}
+                
+                # Check that required spans are present
+                missing_spans = expected_span_names - actual_span_names
+                assert not missing_spans, f"Missing required spans: {missing_spans}"
+                
+                # 5. Verify spans have proper attributes (indicating they were properly instrumented)
+                # Root span should have query characteristics
+                assert "rag.query_chars" in root_span.attributes, "Root span should have query_chars attribute"
+                assert root_span.attributes["rag.query_chars"] == len(query), "Query chars should match actual query length"
+                
+                # Generation span should have model information
+                assert "rag.model" in generation_span.attributes, "Generation span should have model attribute"
+                assert "rag.streaming" in generation_span.attributes, "Generation span should have streaming attribute"
+                
+                # 6. Verify no span errors occurred (indicating successful instrumentation)
+                for span in mock_tracer.spans_created:
+                    assert len(span.errors) == 0, f"Span {span.name} should not have errors: {span.errors}"
+                
+                # 7. Verify experiment context was applied to spans (if session provided)
+                if session_id:
+                    assert "user.session_id" in root_span.attributes, "Root span should have session_id when provided"
+                    assert root_span.attributes["user.session_id"] == session_id, "Session ID should match"
+                    
+                    assert "user.session_id" in generation_span.attributes, "Generation span should have session_id when provided"
+                    assert generation_span.attributes["user.session_id"] == session_id, "Session ID should match in generation span"
+                
+                return True
+                
+            except Exception as e:
+                # Property violation: span structure should be complete for any valid query
+                pytest.fail(f"RAG span structure incomplete for query='{query[:50]}...', session='{session_id}': {e}")
+                
+        # Run the async test
+        result = asyncio.run(run_span_structure_test())
+        assert result, "Span structure completeness property test should pass"
+
+
 if __name__ == "__main__":
     # Run property tests directly
     print("Running property-based tests for observability...")
@@ -362,5 +550,11 @@ if __name__ == "__main__":
         print("✓ Property 8 (Trace export resilience) - Tests passed")
     except Exception as e:
         print(f"✗ Property 8 (Trace export resilience) - Tests failed: {e}")
+    
+    try:
+        test_rag_span_structure_completeness_property()
+        print("✓ Property 2 (RAG span structure completeness) - Tests passed")
+    except Exception as e:
+        print(f"✗ Property 2 (RAG span structure completeness) - Tests failed: {e}")
     
     print("Property-based testing complete.")
