@@ -1029,6 +1029,286 @@ def test_experiment_tracking_consistency_property(queries: List[str], rag_config
         assert result, "Experiment tracking consistency property test should pass"
 
 
+@composite
+def weaviate_operation_strategy(draw):
+    """Generate realistic Weaviate operation parameters for testing."""
+    operation_types = ["hybrid_search", "fetch_chunks", "vector_search"]
+    operation_type = draw(st.sampled_from(operation_types))
+    
+    # Generate realistic collection names
+    collections = ["Document", "Chunk", "Embedding"]
+    collection = draw(st.sampled_from(collections))
+    
+    # Generate query parameters
+    query_text = draw(st.text(min_size=1, max_size=200, alphabet=st.characters(whitelist_categories=('Lu', 'Ll', 'Nd', 'Pc', 'Pd', 'Zs'))))
+    assume(query_text.strip())
+    
+    # Generate vector dimensions (common embedding sizes)
+    vector_dims = [384, 512, 768, 1024, 1536, 2048]
+    vector_dim = draw(st.sampled_from(vector_dims))
+    
+    # Generate limits and counts
+    limit = draw(st.integers(min_value=1, max_value=50))
+    doc_count = draw(st.integers(min_value=0, max_value=100))
+    
+    return {
+        "operation_type": operation_type,
+        "collection": collection,
+        "query": query_text.strip(),
+        "vector_dim": vector_dim,
+        "limit": limit,
+        "doc_count": doc_count,
+        "alpha": draw(st.floats(min_value=0.0, max_value=1.0)),
+        "chunk_ids": [f"chunk_{i}" for i in range(draw(st.integers(min_value=1, max_value=10)))]
+    }
+
+
+@settings(max_examples=100, deadline=None)
+@given(
+    weaviate_op=weaviate_operation_strategy(),
+    rag_config=rag_config_strategy(),
+    session_id=session_id_strategy()
+)
+def test_weaviate_operation_tracing_property(weaviate_op: Dict[str, Any], rag_config: Dict[str, Any], session_id: str):
+    """
+    **Feature: verba-observability, Property 6: Weaviate operation tracing**
+    
+    Property: For any Weaviate client operation, the system should create spans with 
+    timing information, query parameters, and response metrics.
+    
+    This test verifies that:
+    1. Weaviate operations create appropriate spans (weaviate.hybrid_search, weaviate.fetch_chunks)
+    2. Spans include timing information (response_time_ms)
+    3. Spans include query parameters (collection, query_type, limits, etc.)
+    4. Spans include response metrics (results_count, success status)
+    5. All Weaviate operations are properly instrumented regardless of operation type
+    6. Span attributes match the actual operation parameters
+    """
+    
+    # Setup mock tracer that tracks Weaviate spans
+    mock_tracer = MockTracer()
+    
+    # Create a real attach_rag_attributes function that actually sets attributes
+    def real_attach_rag_attributes(span, attributes):
+        for key, value in attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+    
+    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
+         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
+         patch('goldenverba.observability.handle_span_error') as mock_handle_error, \
+         patch('goldenverba.observability.create_experiment_context') as mock_experiment:
+        
+        # Setup experiment context mock
+        mock_experiment.return_value = {
+            "exp.name": "verba_rag_experiment_001",
+            "exp.variant": "A" if hash(session_id) % 2 == 0 else "B",
+            "user.session_id": session_id
+        }
+        
+        # Import WeaviateManager to test Weaviate operations
+        from goldenverba.components.managers import WeaviateManager
+        
+        # Create a mock Weaviate client with realistic responses
+        mock_client = Mock()
+        mock_collection = Mock()
+        mock_client.collections.get.return_value = mock_collection
+        
+        # Mock hybrid search response
+        mock_hybrid_response = Mock()
+        mock_hybrid_response.objects = [
+            Mock(properties={"text": f"Document {i}", "chunk_id": i, "doc_uuid": f"doc_{i}"})
+            for i in range(weaviate_op["doc_count"])
+        ]
+        mock_collection.query.hybrid = AsyncMock(return_value=mock_hybrid_response)
+        
+        # Mock fetch objects response
+        mock_fetch_response = Mock()
+        mock_fetch_response.objects = [
+            Mock(properties={"text": f"Chunk {chunk_id}", "chunk_id": chunk_id})
+            for chunk_id in weaviate_op["chunk_ids"]
+        ]
+        mock_collection.query.fetch_objects = AsyncMock(return_value=mock_fetch_response)
+        
+        # Create WeaviateManager instance
+        weaviate_manager = WeaviateManager()
+        weaviate_manager.embedding_table = {"TestEmbedder": weaviate_op["collection"]}
+        
+        # Mock the verify_embedding_collection method to return True
+        weaviate_manager.verify_embedding_collection = AsyncMock(return_value=True)
+        
+        async def run_weaviate_tracing_test():
+            """Execute Weaviate operations and verify tracing."""
+            try:
+                # Test different Weaviate operations based on the generated operation type
+                if weaviate_op["operation_type"] in ["hybrid_search", "vector_search"]:
+                    # Both hybrid_search and vector_search use the same hybrid_chunks method
+                    # Test hybrid search operation (from hybrid_chunks method)
+                    result = await weaviate_manager.hybrid_chunks(
+                        client=mock_client,
+                        embedder="TestEmbedder",
+                        query=weaviate_op["query"],
+                        vector=[0.1] * weaviate_op["vector_dim"],
+                        limit_mode="Fixed",
+                        limit=weaviate_op["limit"],
+                        labels=[],
+                        document_uuids=[]
+                    )
+                    
+                    # Verify the operation completed successfully
+                    assert result is not None, "Hybrid search should return results"
+                    
+                    # Find the weaviate.hybrid_search span
+                    weaviate_spans = [span for span in mock_tracer.spans_created if span.name == "weaviate.hybrid_search"]
+                    assert len(weaviate_spans) >= 1, f"Expected at least 1 weaviate.hybrid_search span, got {len(weaviate_spans)}"
+                    
+                    weaviate_span = weaviate_spans[0]
+                    
+                    # Verify Requirements 8.1: Spans around Weaviate client calls with timing information
+                    assert "weaviate.response_time_ms" in weaviate_span.attributes, \
+                        "Weaviate span should include response timing information"
+                    assert isinstance(weaviate_span.attributes["weaviate.response_time_ms"], (int, float)), \
+                        "Response time should be numeric"
+                    assert weaviate_span.attributes["weaviate.response_time_ms"] >= 0, \
+                        "Response time should be non-negative"
+                    
+                    # Verify Requirements 8.2: Query parameters, collection name, and top-k configuration
+                    assert "weaviate.collection" in weaviate_span.attributes, \
+                        "Weaviate span should include collection name"
+                    assert weaviate_span.attributes["weaviate.collection"] == weaviate_op["collection"], \
+                        f"Collection should be {weaviate_op['collection']}, got {weaviate_span.attributes.get('weaviate.collection')}"
+                    
+                    assert "weaviate.query_type" in weaviate_span.attributes, \
+                        "Weaviate span should include query type"
+                    assert weaviate_span.attributes["weaviate.query_type"] == "hybrid", \
+                        f"Query type should be 'hybrid', got {weaviate_span.attributes.get('weaviate.query_type')}"
+                    
+                    assert "weaviate.query_chars" in weaviate_span.attributes, \
+                        "Weaviate span should include query character count"
+                    assert weaviate_span.attributes["weaviate.query_chars"] == len(weaviate_op["query"]), \
+                        f"Query chars should be {len(weaviate_op['query'])}, got {weaviate_span.attributes.get('weaviate.query_chars')}"
+                    
+                    assert "weaviate.limit" in weaviate_span.attributes, \
+                        "Weaviate span should include limit parameter"
+                    assert weaviate_span.attributes["weaviate.limit"] == weaviate_op["limit"], \
+                        f"Limit should be {weaviate_op['limit']}, got {weaviate_span.attributes.get('weaviate.limit')}"
+                    
+                    assert "weaviate.vector_dimensions" in weaviate_span.attributes, \
+                        "Weaviate span should include vector dimensions"
+                    assert weaviate_span.attributes["weaviate.vector_dimensions"] == weaviate_op["vector_dim"], \
+                        f"Vector dimensions should be {weaviate_op['vector_dim']}, got {weaviate_span.attributes.get('weaviate.vector_dimensions')}"
+                    
+                    # Verify Requirements 8.3: Response timing and document count metrics
+                    assert "weaviate.results_count" in weaviate_span.attributes, \
+                        "Weaviate span should include results count"
+                    assert weaviate_span.attributes["weaviate.results_count"] == weaviate_op["doc_count"], \
+                        f"Results count should be {weaviate_op['doc_count']}, got {weaviate_span.attributes.get('weaviate.results_count')}"
+                    
+                    assert "weaviate.success" in weaviate_span.attributes, \
+                        "Weaviate span should include success status"
+                    assert weaviate_span.attributes["weaviate.success"] is True, \
+                        f"Success should be True for successful operations, got {weaviate_span.attributes.get('weaviate.success')}"
+                
+                elif weaviate_op["operation_type"] == "fetch_chunks":
+                    # Test fetch chunks operation (from get_chunk_by_ids method)
+                    chunk_ids_as_ints = [i for i in range(len(weaviate_op["chunk_ids"]))]
+                    result = await weaviate_manager.get_chunk_by_ids(
+                        client=mock_client,
+                        embedder="TestEmbedder",
+                        doc_uuid="test_doc_uuid",
+                        ids=chunk_ids_as_ints
+                    )
+                    
+                    # Verify the operation completed successfully
+                    assert result is not None, "Fetch chunks should return results"
+                    
+                    # Find the weaviate.fetch_chunks span
+                    weaviate_spans = [span for span in mock_tracer.spans_created if span.name == "weaviate.fetch_chunks"]
+                    assert len(weaviate_spans) >= 1, f"Expected at least 1 weaviate.fetch_chunks span, got {len(weaviate_spans)}"
+                    
+                    weaviate_span = weaviate_spans[0]
+                    
+                    # Verify Requirements 8.1: Spans around Weaviate client calls with timing information
+                    assert "weaviate.response_time_ms" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include response timing information"
+                    assert isinstance(weaviate_span.attributes["weaviate.response_time_ms"], (int, float)), \
+                        "Response time should be numeric"
+                    assert weaviate_span.attributes["weaviate.response_time_ms"] >= 0, \
+                        "Response time should be non-negative"
+                    
+                    # Verify Requirements 8.2: Query parameters and collection name
+                    assert "weaviate.collection" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include collection name"
+                    assert weaviate_span.attributes["weaviate.collection"] == weaviate_op["collection"], \
+                        f"Collection should be {weaviate_op['collection']}, got {weaviate_span.attributes.get('weaviate.collection')}"
+                    
+                    assert "weaviate.query_type" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include query type"
+                    assert weaviate_span.attributes["weaviate.query_type"] == "fetch_objects", \
+                        f"Query type should be 'fetch_objects', got {weaviate_span.attributes.get('weaviate.query_type')}"
+                    
+                    assert "weaviate.chunk_ids_count" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include chunk IDs count"
+                    assert weaviate_span.attributes["weaviate.chunk_ids_count"] == len(weaviate_op["chunk_ids"]), \
+                        f"Chunk IDs count should be {len(weaviate_op['chunk_ids'])}, got {weaviate_span.attributes.get('weaviate.chunk_ids_count')}"
+                    
+                    # Verify Requirements 8.3: Response timing and document count metrics
+                    assert "weaviate.results_count" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include results count"
+                    assert weaviate_span.attributes["weaviate.results_count"] == len(weaviate_op["chunk_ids"]), \
+                        f"Results count should be {len(weaviate_op['chunk_ids'])}, got {weaviate_span.attributes.get('weaviate.results_count')}"
+                    
+                    assert "weaviate.success" in weaviate_span.attributes, \
+                        "Weaviate fetch span should include success status"
+                    assert weaviate_span.attributes["weaviate.success"] is True, \
+                        f"Success should be True for successful operations, got {weaviate_span.attributes.get('weaviate.success')}"
+                
+                # Verify general span properties for all Weaviate operations
+                weaviate_spans = [span for span in mock_tracer.spans_created if span.name.startswith("weaviate.")]
+                assert len(weaviate_spans) >= 1, "At least one Weaviate span should be created"
+                
+                for span in weaviate_spans:
+                    # Verify no span errors occurred
+                    assert len(span.errors) == 0, f"Weaviate span {span.name} should not have errors: {span.errors}"
+                    
+                    # Verify span is properly recording
+                    assert span.is_recording, f"Weaviate span {span.name} should be recording"
+                    
+                    # Verify required attributes are present and have correct types
+                    assert "weaviate.collection" in span.attributes, f"Span {span.name} missing collection attribute"
+                    assert isinstance(span.attributes["weaviate.collection"], str), "Collection should be string"
+                    
+                    assert "weaviate.query_type" in span.attributes, f"Span {span.name} missing query_type attribute"
+                    assert isinstance(span.attributes["weaviate.query_type"], str), "Query type should be string"
+                    
+                    assert "weaviate.success" in span.attributes, f"Span {span.name} missing success attribute"
+                    assert isinstance(span.attributes["weaviate.success"], bool), "Success should be boolean"
+                    
+                    if "weaviate.response_time_ms" in span.attributes:
+                        assert isinstance(span.attributes["weaviate.response_time_ms"], (int, float)), "Response time should be numeric"
+                        assert span.attributes["weaviate.response_time_ms"] >= 0, "Response time should be non-negative"
+                    
+                    if "weaviate.results_count" in span.attributes:
+                        assert isinstance(span.attributes["weaviate.results_count"], int), "Results count should be integer"
+                        assert span.attributes["weaviate.results_count"] >= 0, "Results count should be non-negative"
+                
+                # Verify that attach_rag_attributes was called for Weaviate spans
+                assert mock_attach.call_count >= 2, "attach_rag_attributes should be called for Weaviate operations"
+                
+                # Verify no span errors were handled (indicating successful operations)
+                assert mock_handle_error.call_count == 0, "No span errors should be handled for successful Weaviate operations"
+                
+                return True
+                
+            except Exception as e:
+                # Property violation: Weaviate operations should be properly traced
+                pytest.fail(f"Weaviate operation tracing failed for operation='{weaviate_op['operation_type']}', collection='{weaviate_op['collection']}': {e}")
+                
+        # Run the async test
+        result = asyncio.run(run_weaviate_tracing_test())
+        assert result, "Weaviate operation tracing property test should pass"
+
+
 if __name__ == "__main__":
     # Run property tests directly
     print("Running property-based tests for observability...")
@@ -1065,5 +1345,11 @@ if __name__ == "__main__":
         print("✓ Property 4 (Experiment tracking consistency) - Tests passed")
     except Exception as e:
         print(f"✗ Property 4 (Experiment tracking consistency) - Tests failed: {e}")
+    
+    try:
+        test_weaviate_operation_tracing_property()
+        print("✓ Property 6 (Weaviate operation tracing) - Tests passed")
+    except Exception as e:
+        print(f"✗ Property 6 (Weaviate operation tracing) - Tests failed: {e}")
     
     print("Property-based testing complete.")
