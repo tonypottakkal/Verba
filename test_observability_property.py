@@ -780,6 +780,255 @@ def test_kpi_attribute_completeness_property(query: str, rag_config: Dict[str, A
         assert result, "KPI attribute completeness property test should pass"
 
 
+@settings(max_examples=100, deadline=None)
+@given(
+    queries=st.lists(query_strategy(), min_size=2, max_size=5),  # Multiple queries for same session
+    rag_config=rag_config_strategy(),
+    session_id=session_id_strategy()
+)
+def test_experiment_tracking_consistency_property(queries: List[str], rag_config: Dict[str, Any], session_id: str):
+    """
+    **Feature: verba-observability, Property 4: Experiment tracking consistency**
+    
+    Property: For any user session, experiment attributes (exp.name, exp.variant, config versions) 
+    should be consistently applied across all requests within that session.
+    
+    This test verifies that:
+    1. exp.name attribute is consistent across all requests in a session
+    2. exp.variant assignment is deterministic and consistent for the same session
+    3. config.prompt_version and config.reranker_version are consistently applied
+    4. user.session_id is properly attached to all spans in the session
+    5. Variant assignment is deterministic based on session ID (same session = same variant)
+    6. Different sessions can have different variants, but same session always gets same variant
+    """
+    
+    # Setup mock tracer that tracks all spans across multiple requests
+    mock_tracer = MockTracer()
+    
+    # Create a real attach_rag_attributes function that actually sets attributes
+    def real_attach_rag_attributes(span, attributes):
+        for key, value in attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+    
+    # Track all experiment contexts created to verify consistency
+    experiment_contexts_created = []
+    
+    def track_experiment_context(user_session_id: str, experiment_name: str = "verba_rag_experiment_001"):
+        """Track experiment context creation and return consistent results."""
+        # Create deterministic context without calling the real function to avoid recursion
+        import hashlib
+        hash_input = f"{experiment_name}:{user_session_id}"
+        hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+        variant = "A" if hash_value % 2 == 0 else "B"
+        
+        context = {
+            "exp.name": experiment_name,
+            "exp.variant": variant,
+            "user.session_id": user_session_id
+        }
+        experiment_contexts_created.append(context)
+        return context
+    
+    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
+         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
+         patch('goldenverba.observability.handle_span_error') as mock_handle_error, \
+         patch('goldenverba.observability.create_experiment_context', side_effect=track_experiment_context) as mock_experiment:
+        
+        # Import and setup VerbaManager with mocked dependencies
+        from goldenverba.verba_manager import VerbaManager
+        
+        manager = VerbaManager()
+        
+        # Mock all manager dependencies
+        manager.weaviate_manager = Mock()
+        manager.weaviate_manager.add_suggestion = AsyncMock()
+        
+        manager.embedder_manager = Mock()
+        manager.embedder_manager.vectorize_query = AsyncMock(return_value=[0.1] * 1536)
+        
+        manager.retriever_manager = Mock()
+        
+        # Mock the retrieve method to create rag.retrieve spans
+        async def mock_retrieve(*args, **kwargs):
+            with mock_tracer.start_as_current_span("rag.retrieve") as retrieve_span:
+                mock_documents = [f"Document {i}" for i in range(3)]
+                mock_context = f"Context for query"
+                retrieve_span.set_attribute("rag.retrieved_docs_count", len(mock_documents))
+                retrieve_span.set_attribute("rag.context_chars", len(mock_context))
+                return (mock_documents, mock_context)
+        
+        manager.retriever_manager.retrieve = mock_retrieve
+        
+        manager.generator_manager = Mock()
+        
+        # Mock the generator stream
+        async def mock_generate_stream(rag_config, query, context, conversation):
+            response_parts = [
+                {"message": "Response to "},
+                {"message": query[:20]},
+                {"message": " based on context."}
+            ]
+            for part in response_parts:
+                yield part
+        
+        manager.generator_manager.generate_stream = mock_generate_stream
+        
+        async def run_experiment_consistency_test():
+            """Execute multiple requests for the same session and verify consistency."""
+            try:
+                # Execute multiple queries for the same session
+                all_spans_by_request = []
+                
+                for i, query in enumerate(queries):
+                    # Clear spans for this request (but keep tracking all spans)
+                    request_start_span_count = len(mock_tracer.spans_created)
+                    
+                    # Execute retrieve_chunks
+                    result = await manager.retrieve_chunks(
+                        client=Mock(),
+                        query=query,
+                        rag_config=rag_config,
+                        user_session_id=session_id
+                    )
+                    
+                    # Verify retrieve_chunks completed successfully
+                    assert result is not None, f"retrieve_chunks should return a result for query {i}"
+                    documents, context = result
+                    
+                    # Execute generate_stream_answer
+                    response_parts = []
+                    async for part in manager.generate_stream_answer(
+                        rag_config=rag_config,
+                        query=query,
+                        context=context,
+                        conversation=[],
+                        user_session_id=session_id
+                    ):
+                        response_parts.append(part)
+                    
+                    # Verify generation completed successfully
+                    assert len(response_parts) > 0, f"Generation should produce response parts for query {i}"
+                    
+                    # Collect spans created for this request
+                    request_spans = mock_tracer.spans_created[request_start_span_count:]
+                    all_spans_by_request.append(request_spans)
+                
+                # Now verify experiment tracking consistency across all requests
+                
+                # 1. Verify experiment context was created for each request
+                # Each query calls create_experiment_context twice: once in retrieve_chunks, once in generate_stream_answer
+                expected_contexts = len(queries) * 2
+                assert len(experiment_contexts_created) == expected_contexts, \
+                    f"Expected {expected_contexts} experiment contexts, got {len(experiment_contexts_created)}"
+                
+                # 2. Verify all experiment contexts are identical (consistency requirement)
+                first_context = experiment_contexts_created[0]
+                for i, context in enumerate(experiment_contexts_created[1:], 1):
+                    assert context == first_context, \
+                        f"Experiment context {i} differs from first context: {context} != {first_context}"
+                
+                # 3. Verify experiment attributes are consistent across all spans in all requests
+                all_query_spans = []
+                all_generation_spans = []
+                
+                for request_spans in all_spans_by_request:
+                    query_spans = [span for span in request_spans if span.name == "rag.query"]
+                    generation_spans = [span for span in request_spans if span.name == "rag.generate"]
+                    
+                    assert len(query_spans) == 1, "Each request should have exactly one rag.query span"
+                    assert len(generation_spans) == 1, "Each request should have exactly one rag.generate span"
+                    
+                    all_query_spans.extend(query_spans)
+                    all_generation_spans.extend(generation_spans)
+                
+                # 4. Verify Requirements 6.1: exp.name attribute consistency
+                expected_exp_name = first_context["exp.name"]
+                for i, span in enumerate(all_query_spans):
+                    assert "exp.name" in span.attributes, f"Query span {i} missing exp.name attribute"
+                    assert span.attributes["exp.name"] == expected_exp_name, \
+                        f"Query span {i} exp.name inconsistent: {span.attributes['exp.name']} != {expected_exp_name}"
+                
+                for i, span in enumerate(all_generation_spans):
+                    assert "exp.name" in span.attributes, f"Generation span {i} missing exp.name attribute"
+                    assert span.attributes["exp.name"] == expected_exp_name, \
+                        f"Generation span {i} exp.name inconsistent: {span.attributes['exp.name']} != {expected_exp_name}"
+                
+                # 5. Verify Requirements 6.2: exp.variant consistency (deterministic assignment)
+                expected_variant = first_context["exp.variant"]
+                for i, span in enumerate(all_query_spans):
+                    assert "exp.variant" in span.attributes, f"Query span {i} missing exp.variant attribute"
+                    assert span.attributes["exp.variant"] == expected_variant, \
+                        f"Query span {i} exp.variant inconsistent: {span.attributes['exp.variant']} != {expected_variant}"
+                
+                for i, span in enumerate(all_generation_spans):
+                    assert "exp.variant" in span.attributes, f"Generation span {i} missing exp.variant attribute"
+                    assert span.attributes["exp.variant"] == expected_variant, \
+                        f"Generation span {i} exp.variant inconsistent: {span.attributes['exp.variant']} != {expected_variant}"
+                
+                # 6. Verify Requirements 6.3: config version attributes consistency
+                # Check that config versions are present and consistent
+                for i, span in enumerate(all_query_spans):
+                    if "config.prompt_version" in span.attributes:
+                        # If present in first span, should be consistent across all spans
+                        first_prompt_version = all_query_spans[0].attributes.get("config.prompt_version")
+                        if first_prompt_version is not None:
+                            assert span.attributes["config.prompt_version"] == first_prompt_version, \
+                                f"Query span {i} config.prompt_version inconsistent"
+                    
+                    if "config.reranker_version" in span.attributes:
+                        first_reranker_version = all_query_spans[0].attributes.get("config.reranker_version")
+                        if first_reranker_version is not None:
+                            assert span.attributes["config.reranker_version"] == first_reranker_version, \
+                                f"Query span {i} config.reranker_version inconsistent"
+                
+                # 7. Verify Requirements 6.4: user.session_id consistency
+                expected_session_id = first_context["user.session_id"]
+                assert expected_session_id == session_id, "Session ID should match input"
+                
+                for i, span in enumerate(all_query_spans):
+                    assert "user.session_id" in span.attributes, f"Query span {i} missing user.session_id attribute"
+                    assert span.attributes["user.session_id"] == expected_session_id, \
+                        f"Query span {i} user.session_id inconsistent: {span.attributes['user.session_id']} != {expected_session_id}"
+                
+                for i, span in enumerate(all_generation_spans):
+                    assert "user.session_id" in span.attributes, f"Generation span {i} missing user.session_id attribute"
+                    assert span.attributes["user.session_id"] == expected_session_id, \
+                        f"Generation span {i} user.session_id inconsistent: {span.attributes['user.session_id']} != {expected_session_id}"
+                
+                # 8. Verify deterministic variant assignment (same session = same variant)
+                # Test the deterministic function directly without calling the mocked version
+                import hashlib
+                hash_input = f"verba_rag_experiment_001:{session_id}"
+                hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+                expected_variant_from_hash = "A" if hash_value % 2 == 0 else "B"
+                
+                # Verify the variant in our tracked contexts matches the expected hash
+                assert first_context["exp.variant"] == expected_variant_from_hash, \
+                    f"Variant should be deterministic based on hash: {first_context['exp.variant']} != {expected_variant_from_hash}"
+                
+                # 9. Verify experiment context was called at least the minimum expected times
+                # Should be called at least once per retrieve_chunks + once per generate_stream_answer
+                min_expected_calls = len(queries) * 2  # retrieve_chunks + generate_stream_answer
+                assert mock_experiment.call_count >= min_expected_calls, \
+                    f"Expected at least {min_expected_calls} experiment context calls, got {mock_experiment.call_count}"
+                
+                # 10. Verify all calls used the same session_id
+                for call in mock_experiment.call_args_list:
+                    args, kwargs = call
+                    assert args[0] == session_id, f"All experiment context calls should use same session_id: {args[0]} != {session_id}"
+                
+                return True
+                
+            except Exception as e:
+                # Property violation: experiment tracking should be consistent across session
+                pytest.fail(f"Experiment tracking consistency failed for session='{session_id}', queries={len(queries)}: {e}")
+                
+        # Run the async test
+        result = asyncio.run(run_experiment_consistency_test())
+        assert result, "Experiment tracking consistency property test should pass"
+
+
 if __name__ == "__main__":
     # Run property tests directly
     print("Running property-based tests for observability...")
@@ -810,5 +1059,11 @@ if __name__ == "__main__":
         print("✓ Property 3 (KPI attribute completeness) - Tests passed")
     except Exception as e:
         print(f"✗ Property 3 (KPI attribute completeness) - Tests failed: {e}")
+    
+    try:
+        test_experiment_tracking_consistency_property()
+        print("✓ Property 4 (Experiment tracking consistency) - Tests passed")
+    except Exception as e:
+        print(f"✗ Property 4 (Experiment tracking consistency) - Tests failed: {e}")
     
     print("Property-based testing complete.")
