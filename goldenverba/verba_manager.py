@@ -755,21 +755,42 @@ class VerbaManager:
                 retriever = rag_config["Retriever"].selected
                 embedder = rag_config["Embedder"].selected
 
-                await self.weaviate_manager.add_suggestion(client, query)
+                # Add suggestion with error handling
+                try:
+                    await self.weaviate_manager.add_suggestion(client, query)
+                except Exception as suggestion_error:
+                    # Log but don't fail the entire request for suggestion errors
+                    span.set_attribute("rag.suggestion_error", str(suggestion_error))
+                    msg.warn(f"Failed to add suggestion: {suggestion_error}")
 
-                vector = await self.embedder_manager.vectorize_query(
-                    embedder, query, rag_config
-                )
-                documents, context = await self.retriever_manager.retrieve(
-                    client,
-                    retriever,
-                    query,
-                    vector,
-                    rag_config,
-                    self.weaviate_manager,
-                    labels,
-                    document_uuids,
-                )
+                # Vectorize query with comprehensive error handling
+                try:
+                    vector = await self.embedder_manager.vectorize_query(
+                        embedder, query, rag_config
+                    )
+                except Exception as embedding_error:
+                    handle_span_error(span, embedding_error)
+                    span.set_attribute("rag.embedding_error", str(embedding_error))
+                    span.set_attribute("rag.success", False)
+                    raise Exception(f"Embedding failed: {str(embedding_error)}") from embedding_error
+
+                # Retrieve documents with comprehensive error handling
+                try:
+                    documents, context = await self.retriever_manager.retrieve(
+                        client,
+                        retriever,
+                        query,
+                        vector,
+                        rag_config,
+                        self.weaviate_manager,
+                        labels,
+                        document_uuids,
+                    )
+                except Exception as retrieval_error:
+                    handle_span_error(span, retrieval_error)
+                    span.set_attribute("rag.retrieval_error", str(retrieval_error))
+                    span.set_attribute("rag.success", False)
+                    raise Exception(f"Retrieval failed: {str(retrieval_error)}") from retrieval_error
 
                 # Attach retrieval results attributes
                 result_attributes = {
@@ -783,8 +804,12 @@ class VerbaManager:
                 
             except Exception as e:
                 handle_span_error(span, e)
-                # Attach failure attribute
+                # Attach failure attribute and error details
                 span.set_attribute("rag.success", False)
+                span.set_attribute("rag.error_stage", "query_processing")
+                
+                # Log the error for debugging
+                msg.fail(f"RAG query failed: {str(e)}")
                 raise
 
     async def generate_stream_answer(
@@ -832,18 +857,41 @@ class VerbaManager:
 
                 full_text = ""
                 completion_tokens = 0
+                stream_error_count = 0
                 
-                async for result in self.generator_manager.generate_stream(
-                    rag_config, query, context, conversation
-                ):
-                    full_text += result["message"]
-                    completion_tokens += len(result["message"].split())  # Approximate token count
-                    yield result
+                try:
+                    async for result in self.generator_manager.generate_stream(
+                        rag_config, query, context, conversation
+                    ):
+                        try:
+                            full_text += result["message"]
+                            completion_tokens += len(result["message"].split())  # Approximate token count
+                            yield result
+                        except Exception as stream_error:
+                            stream_error_count += 1
+                            span.set_attribute("rag.stream_error_count", stream_error_count)
+                            span.set_attribute("rag.stream_error", str(stream_error))
+                            msg.warn(f"Stream processing error: {stream_error}")
+                            
+                            # Continue streaming but track errors
+                            if stream_error_count > 10:  # Prevent infinite error loops
+                                raise Exception(f"Too many stream errors: {stream_error_count}")
+                
+                except Exception as generation_error:
+                    handle_span_error(span, generation_error)
+                    span.set_attribute("rag.generation_error", str(generation_error))
+                    span.set_attribute("rag.success", False)
+                    span.set_attribute("rag.error_stage", "generation")
+                    
+                    # Log the error for debugging
+                    msg.fail(f"Generation failed: {str(generation_error)}")
+                    raise Exception(f"Generation failed: {str(generation_error)}") from generation_error
                 
                 # Attach final metrics after streaming completes
                 final_attributes = {
                     "rag.completion_tokens": completion_tokens,
                     "rag.total_tokens": generation_attributes["rag.prompt_tokens"] + completion_tokens,
+                    "rag.stream_error_count": stream_error_count,
                     "rag.success": True
                 }
                 attach_rag_attributes(span, final_attributes)
@@ -851,6 +899,10 @@ class VerbaManager:
             except Exception as e:
                 handle_span_error(span, e)
                 span.set_attribute("rag.success", False)
+                span.set_attribute("rag.error_stage", "generation_setup")
+                
+                # Log the error for debugging
+                msg.fail(f"Generation stream setup failed: {str(e)}")
                 raise
 
 

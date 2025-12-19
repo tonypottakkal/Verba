@@ -7,7 +7,7 @@ import sys
 import os
 import asyncio
 import json
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, AsyncMock, patch
 
 # Add the goldenverba package to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
@@ -44,6 +44,10 @@ def test_feedback_span_creation():
         mock_tracer.start_as_current_span.return_value.__exit__ = Mock(return_value=None)
         mock_get_tracer.return_value = mock_tracer
         
+        # Import observability functions directly
+        import sys
+        import os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
         from goldenverba.observability import record_feedback, create_feedback_span
         
         # Test basic feedback recording
@@ -81,7 +85,7 @@ async def test_feedback_api_endpoint():
          patch('goldenverba.observability.create_feedback_span') as mock_create_feedback_span:
         
         # Setup mocks
-        mock_client_manager.connect.return_value = Mock()
+        mock_client_manager.connect = AsyncMock(return_value=Mock())
         mock_record_feedback.return_value = True
         mock_create_feedback_span.return_value = True
         

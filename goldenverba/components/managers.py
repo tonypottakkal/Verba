@@ -1283,47 +1283,96 @@ class EmbeddingManager:
                 try:
                     start_time = time.time()
                     
-                    if embedder in self.embedders:
-                        config = rag_config["Embedder"].components[embedder].config
-                        
-                        # Attach embedding attributes
-                        embedding_attributes = {
-                            "embedding.model": embedder,
-                            "embedding.input_chars": len(content),
-                            "embedding.input_tokens": len(content.split()),  # Approximate token count
-                        }
-                        
-                        # Add model-specific configuration
-                        if "Model" in config:
-                            embedding_attributes["embedding.model_name"] = config["Model"].value
-                        
-                        attach_rag_attributes(span, embedding_attributes)
-                        
-                        embeddings = await self.embedders[embedder].vectorize(config, [content])
-                        
-                        # Attach result attributes
-                        end_time = time.time()
-                        result_attributes = {
-                            "embedding.latency_ms": round((end_time - start_time) * 1000, 2),
-                            "embedding.vector_dimensions": len(embeddings[0]) if embeddings else 0,
-                            "embedding.success": True
-                        }
-                        attach_rag_attributes(span, result_attributes)
-                        
-                        return embeddings[0]
-                    else:
-                        error = Exception(f"{embedder} Embedder not found")
+                    # Validate inputs
+                    if not content or not content.strip():
+                        error = ValueError("Empty or whitespace-only content provided for embedding")
                         handle_span_error(span, error)
                         span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "invalid_input")
                         raise error
+                    
+                    if embedder not in self.embedders:
+                        error = KeyError(f"Embedder '{embedder}' not found in available embedders: {list(self.embedders.keys())}")
+                        handle_span_error(span, error)
+                        span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "embedder_not_found")
+                        raise error
+                    
+                    try:
+                        config = rag_config["Embedder"].components[embedder].config
+                    except KeyError as config_error:
+                        error = KeyError(f"Configuration not found for embedder '{embedder}': {str(config_error)}")
+                        handle_span_error(span, error)
+                        span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "config_error")
+                        raise error
+                    
+                    # Attach embedding attributes
+                    embedding_attributes = {
+                        "embedding.model": embedder,
+                        "embedding.input_chars": len(content),
+                        "embedding.input_tokens": len(content.split()),  # Approximate token count
+                    }
+                    
+                    # Add model-specific configuration
+                    if "Model" in config:
+                        embedding_attributes["embedding.model_name"] = config["Model"].value
+                    
+                    attach_rag_attributes(span, embedding_attributes)
+                    
+                    try:
+                        embeddings = await self.embedders[embedder].vectorize(config, [content])
+                    except Exception as vectorize_error:
+                        handle_span_error(span, vectorize_error)
+                        span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "vectorization_failed")
+                        span.set_attribute("embedding.error_details", str(vectorize_error))
+                        raise Exception(f"Vectorization failed for embedder '{embedder}': {str(vectorize_error)}") from vectorize_error
+                    
+                    # Validate embedding results
+                    if not embeddings or len(embeddings) == 0:
+                        error = ValueError(f"Embedder '{embedder}' returned empty results")
+                        handle_span_error(span, error)
+                        span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "empty_result")
+                        raise error
+                    
+                    if not isinstance(embeddings[0], list) or len(embeddings[0]) == 0:
+                        error = ValueError(f"Embedder '{embedder}' returned invalid embedding format")
+                        handle_span_error(span, error)
+                        span.set_attribute("embedding.success", False)
+                        span.set_attribute("embedding.error_type", "invalid_result_format")
+                        raise error
+                    
+                    # Attach result attributes
+                    end_time = time.time()
+                    result_attributes = {
+                        "embedding.latency_ms": round((end_time - start_time) * 1000, 2),
+                        "embedding.vector_dimensions": len(embeddings[0]),
+                        "embedding.success": True
+                    }
+                    attach_rag_attributes(span, result_attributes)
+                    
+                    return embeddings[0]
                         
                 except Exception as e:
                     handle_span_error(span, e)
                     span.set_attribute("embedding.success", False)
+                    msg.fail(f"Embedding query failed: {str(e)}")
                     raise
                     
-        except Exception as e:
-            raise e
+        except ImportError:
+            # Fallback if observability is not available
+            try:
+                if embedder not in self.embedders:
+                    raise Exception(f"{embedder} Embedder not found")
+                
+                config = rag_config["Embedder"].components[embedder].config
+                embeddings = await self.embedders[embedder].vectorize(config, [content])
+                return embeddings[0]
+            except Exception as e:
+                msg.fail(f"Embedding query failed (no observability): {str(e)}")
+                raise
 
 
 class RetrieverManager:
@@ -1353,19 +1402,42 @@ class RetrieverManager:
                 try:
                     start_time = time.time()
                     
-                    if retriever not in self.retrievers:
-                        error = Exception(f"Retriever {retriever} not found")
+                    # Validate inputs
+                    if not query or not query.strip():
+                        error = ValueError("Empty or whitespace-only query provided for retrieval")
                         handle_span_error(span, error)
                         span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "invalid_query")
+                        raise error
+                    
+                    if not vector or len(vector) == 0:
+                        error = ValueError("Empty or invalid vector provided for retrieval")
+                        handle_span_error(span, error)
+                        span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "invalid_vector")
+                        raise error
+                    
+                    if retriever not in self.retrievers:
+                        error = KeyError(f"Retriever '{retriever}' not found in available retrievers: {list(self.retrievers.keys())}")
+                        handle_span_error(span, error)
+                        span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "retriever_not_found")
                         raise error
 
-                    embedder_model = (
-                        rag_config["Embedder"]
-                        .components[rag_config["Embedder"].selected]
-                        .config["Model"]
-                        .value
-                    )
-                    config = rag_config["Retriever"].components[retriever].config
+                    try:
+                        embedder_model = (
+                            rag_config["Embedder"]
+                            .components[rag_config["Embedder"].selected]
+                            .config["Model"]
+                            .value
+                        )
+                        config = rag_config["Retriever"].components[retriever].config
+                    except KeyError as config_error:
+                        error = KeyError(f"Configuration error for retriever '{retriever}': {str(config_error)}")
+                        handle_span_error(span, error)
+                        span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "config_error")
+                        raise error
                     
                     # Attach retrieval attributes
                     retrieval_attributes = {
@@ -1385,16 +1457,31 @@ class RetrieverManager:
                     
                     attach_rag_attributes(span, retrieval_attributes)
                     
-                    documents, context = await self.retrievers[retriever].retrieve(
-                        client,
-                        query,
-                        vector,
-                        config,
-                        weaviate_manager,
-                        embedder_model,
-                        labels,
-                        document_uuids,
-                    )
+                    try:
+                        documents, context = await self.retrievers[retriever].retrieve(
+                            client,
+                            query,
+                            vector,
+                            config,
+                            weaviate_manager,
+                            embedder_model,
+                            labels,
+                            document_uuids,
+                        )
+                    except Exception as retrieve_error:
+                        handle_span_error(span, retrieve_error)
+                        span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "retrieval_failed")
+                        span.set_attribute("rag.error_details", str(retrieve_error))
+                        raise Exception(f"Retrieval operation failed for retriever '{retriever}': {str(retrieve_error)}") from retrieve_error
+                    
+                    # Validate retrieval results
+                    if documents is None or context is None:
+                        error = ValueError(f"Retriever '{retriever}' returned None results")
+                        handle_span_error(span, error)
+                        span.set_attribute("rag.success", False)
+                        span.set_attribute("rag.error_type", "null_result")
+                        raise error
                     
                     # Attach result attributes
                     end_time = time.time()
@@ -1411,10 +1498,38 @@ class RetrieverManager:
                 except Exception as e:
                     handle_span_error(span, e)
                     span.set_attribute("rag.success", False)
+                    msg.fail(f"Retrieval failed: {str(e)}")
                     raise
 
-        except Exception as e:
-            raise e
+        except ImportError:
+            # Fallback if observability is not available
+            try:
+                if retriever not in self.retrievers:
+                    raise Exception(f"Retriever {retriever} not found")
+
+                embedder_model = (
+                    rag_config["Embedder"]
+                    .components[rag_config["Embedder"].selected]
+                    .config["Model"]
+                    .value
+                )
+                config = rag_config["Retriever"].components[retriever].config
+                
+                documents, context = await self.retrievers[retriever].retrieve(
+                    client,
+                    query,
+                    vector,
+                    config,
+                    weaviate_manager,
+                    embedder_model,
+                    labels,
+                    document_uuids,
+                )
+                
+                return (documents, context)
+            except Exception as e:
+                msg.fail(f"Retrieval failed (no observability): {str(e)}")
+                raise
 
 
 class GeneratorManager:
@@ -1439,6 +1554,13 @@ class GeneratorManager:
         if generator not in self.generators:
             raise Exception(f"Generator {generator} not found")
 
+        # Validate inputs
+        if not query or not query.strip():
+            raise ValueError("Empty or whitespace-only query provided for generation")
+        
+        if context is None:
+            context = ""  # Allow empty context but not None
+        
         # Instrument generation with tracing
         try:
             from goldenverba.observability import get_tracer, attach_rag_attributes, handle_span_error
@@ -1449,6 +1571,14 @@ class GeneratorManager:
             with tracer.start_as_current_span("generation.stream") as span:
                 try:
                     start_time = time.time()
+                    
+                    # Validate generator availability
+                    if generator not in self.generators:
+                        error = KeyError(f"Generator '{generator}' not found in available generators: {list(self.generators.keys())}")
+                        handle_span_error(span, error)
+                        span.set_attribute("generation.success", False)
+                        span.set_attribute("generation.error_type", "generator_not_found")
+                        raise error
                     
                     # Attach generation attributes
                     generation_attributes = {
@@ -1472,20 +1602,46 @@ class GeneratorManager:
                     # Track streaming metrics
                     total_tokens = 0
                     response_count = 0
+                    stream_error_count = 0
                     
-                    async for result in self.generators[generator].generate_stream(
-                        generator_config, query, context, conversation
-                    ):
-                        if "message" in result:
-                            total_tokens += len(result["message"].split())  # Approximate token count
-                            response_count += 1
-                        yield result
+                    try:
+                        async for result in self.generators[generator].generate_stream(
+                            generator_config, query, context, conversation
+                        ):
+                            try:
+                                if "message" in result:
+                                    total_tokens += len(result["message"].split())  # Approximate token count
+                                    response_count += 1
+                                elif "error" in result:
+                                    stream_error_count += 1
+                                    span.set_attribute("generation.stream_error_count", stream_error_count)
+                                    span.set_attribute("generation.last_stream_error", str(result["error"]))
+                                    msg.warn(f"Stream error in result: {result['error']}")
+                                
+                                yield result
+                            except Exception as result_error:
+                                stream_error_count += 1
+                                span.set_attribute("generation.stream_error_count", stream_error_count)
+                                span.set_attribute("generation.result_processing_error", str(result_error))
+                                msg.warn(f"Error processing stream result: {result_error}")
+                                
+                                # Continue streaming but track errors
+                                if stream_error_count > 20:  # Prevent infinite error loops
+                                    raise Exception(f"Too many stream processing errors: {stream_error_count}")
+                    
+                    except Exception as stream_error:
+                        handle_span_error(span, stream_error)
+                        span.set_attribute("generation.success", False)
+                        span.set_attribute("generation.error_type", "stream_failed")
+                        span.set_attribute("generation.error_details", str(stream_error))
+                        raise Exception(f"Generation streaming failed for generator '{generator}': {str(stream_error)}") from stream_error
                     
                     # Attach final metrics after streaming completes
                     end_time = time.time()
                     final_attributes = {
                         "generation.completion_tokens": total_tokens,
                         "generation.response_count": response_count,
+                        "generation.stream_error_count": stream_error_count,
                         "generation.latency_ms": round((end_time - start_time) * 1000, 2),
                         "generation.success": True
                     }
@@ -1498,10 +1654,17 @@ class GeneratorManager:
                     
         except ImportError:
             # Fallback if observability is not available
-            async for result in self.generators[generator].generate_stream(
-                generator_config, query, context, conversation
-            ):
-                yield result
+            try:
+                if generator not in self.generators:
+                    raise Exception(f"Generator {generator} not found")
+                
+                async for result in self.generators[generator].generate_stream(
+                    generator_config, query, context, conversation
+                ):
+                    yield result
+            except Exception as e:
+                msg.fail(f"Generation failed (no observability): {str(e)}")
+                raise
 
     def truncate_conversation_dicts(
         self, conversation_dicts: list[dict[str, any]], max_tokens: int
