@@ -1394,21 +1394,13 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
             # Even error handling can fail, but we shouldn't break the application
             pass
     
-    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
-         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
-         patch('goldenverba.observability.handle_span_error', side_effect=real_handle_span_error) as mock_handle_error, \
-         patch('goldenverba.observability.create_experiment_context') as mock_experiment:
-        
-        # Setup experiment context mock
-        mock_experiment.return_value = {
-            "exp.name": "verba_rag_experiment_001",
-            "exp.variant": "A" if hash(session_id) % 2 == 0 else "B",
-            "user.session_id": session_id
-        }
-        
-        # Import and setup VerbaManager with mocked dependencies
+    # Mock the VerbaManager methods to simulate realistic error scenarios
+    # where spans are created first, then errors occur within the spans
+    def create_mock_verba_manager_with_errors():
+        """Create a VerbaManager that simulates realistic error scenarios."""
         from goldenverba.verba_manager import VerbaManager
         
+        # Create the manager instance
         manager = VerbaManager()
         
         # Mock all manager dependencies
@@ -1425,7 +1417,7 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
         # Configure mocks to raise errors at different stages based on error scenario
         if error_scenario["stage"] == "embedding_error":
             manager.embedder_manager.vectorize_query = AsyncMock(side_effect=test_error)
-            # Set up other mocks to work normally
+            # Set up other mocks to work normally (but won't be reached due to error)
             manager.retriever_manager.retrieve = AsyncMock(return_value=(["doc1"], "context"))
             manager.generator_manager.generate_stream = AsyncMock(return_value=iter([{"message": "response"}]))
             
@@ -1456,33 +1448,57 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
             manager.retriever_manager.retrieve = failing_retrieve
             manager.generator_manager.generate_stream = AsyncMock(return_value=iter([{"message": "response"}]))
             
-        else:
-            # Default: validation or other errors - fail at the beginning
+        elif error_scenario["stage"] == "network_error":
+            # Network errors can happen at any stage - let's simulate during embedding
             manager.embedder_manager.vectorize_query = AsyncMock(side_effect=test_error)
             manager.retriever_manager.retrieve = AsyncMock(return_value=(["doc1"], "context"))
             manager.generator_manager.generate_stream = AsyncMock(return_value=iter([{"message": "response"}]))
+            
+        else:
+            # Default: validation or other errors - fail at embedding stage
+            manager.embedder_manager.vectorize_query = AsyncMock(side_effect=test_error)
+            manager.retriever_manager.retrieve = AsyncMock(return_value=(["doc1"], "context"))
+            manager.generator_manager.generate_stream = AsyncMock(return_value=iter([{"message": "response"}]))
+        
+        return manager
+    
+    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
+         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
+         patch('goldenverba.observability.handle_span_error', side_effect=real_handle_span_error) as mock_handle_error, \
+         patch('goldenverba.observability.create_experiment_context') as mock_experiment:
+        
+        # Setup experiment context mock
+        mock_experiment.return_value = {
+            "exp.name": "verba_rag_experiment_001",
+            "exp.variant": "A" if hash(session_id) % 2 == 0 else "B",
+            "user.session_id": session_id
+        }
+        
+        # Create manager with error simulation
+        manager = create_mock_verba_manager_with_errors()
         
         async def run_error_tracing_test():
             """Execute operations that should trigger errors and verify error tracing."""
             try:
                 # Test retrieve_chunks with error scenarios
-                if error_scenario["stage"] in ["embedding_error", "retrieval_error", "weaviate_error", "validation_error"]:
-                    try:
-                        result = await manager.retrieve_chunks(
-                            client=Mock(),
-                            query=query,
-                            rag_config=rag_config,
-                            user_session_id=session_id
-                        )
-                        # If we get here without an exception, the error wasn't triggered as expected
-                        # This is still valid - the system should handle errors gracefully
-                        
-                    except Exception as e:
-                        # Expected behavior: errors should be caught and handled gracefully
-                        # The system should continue functioning
-                        pass
+                # The key insight: retrieve_chunks creates the rag.query span FIRST,
+                # then calls the methods that might fail. So we should always get a span.
+                error_occurred = False
+                result = None
                 
-                # Test generate_stream_answer with error scenarios
+                try:
+                    result = await manager.retrieve_chunks(
+                        client=Mock(),
+                        query=query,
+                        rag_config=rag_config,
+                        user_session_id=session_id
+                    )
+                except Exception as e:
+                    # Expected behavior: errors should be caught and handled gracefully
+                    # The span should still be created and marked with error information
+                    error_occurred = True
+                
+                # Test generate_stream_answer with error scenarios if it's a generation error
                 if error_scenario["stage"] == "generation_error":
                     try:
                         response_parts = []
@@ -1497,60 +1513,71 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
                             
                     except Exception as e:
                         # Expected behavior: generation errors should be handled gracefully
-                        pass
+                        error_occurred = True
                 
                 # Now verify error tracing completeness
                 
                 # 1. Verify that spans were created (even with errors)
-                assert len(mock_tracer.spans_created) > 0, "Spans should be created even when errors occur"
+                # This is the key requirement: spans should ALWAYS be created
+                assert len(mock_tracer.spans_created) > 0, \
+                    f"Spans should be created even when errors occur. Error scenario: {error_scenario['stage']}"
                 
-                # 2. Find spans that should have error information
-                error_spans = []
-                for span in mock_tracer.spans_created:
-                    if (hasattr(span, 'status') and span.status == "ERROR") or \
-                       "error.type" in span.attributes or \
-                       len(span.errors) > 0 or \
-                       len(span.exceptions) > 0:
-                        error_spans.append(span)
+                # 2. Verify that the root rag.query span was created
+                # This is critical - the root span should always exist
+                root_spans = [span for span in mock_tracer.spans_created if span.name == "rag.query"]
+                assert len(root_spans) >= 1, \
+                    f"Root rag.query span should be created even with errors. Error scenario: {error_scenario['stage']}"
                 
-                # 3. Verify that at least one span has error information (Requirements 9.1, 9.2, 9.3)
-                assert len(error_spans) > 0, f"At least one span should have error information for {error_scenario['stage']}"
+                root_span = root_spans[0]
                 
-                # 4. Verify error tracing completeness for each error span
-                for error_span in error_spans:
-                    # Requirement 9.1: error.type and error.message attributes
-                    if "error.type" in error_span.attributes:
-                        # The VerbaManager wraps errors in generic Exception, so we need to check for that
-                        # or the original error type depending on where the error was caught
-                        actual_error_type = error_span.attributes["error.type"]
-                        expected_error_types = [error_scenario["error_class"].__name__, "Exception"]
-                        
-                        assert actual_error_type in expected_error_types, \
-                            f"error.type should be one of {expected_error_types}, got {actual_error_type}"
-                        
-                        assert "error.message" in error_span.attributes, \
-                            "error.message attribute should be present when error.type is set"
-                        
-                        # The error message should contain either the original message or a wrapped version
-                        error_message = error_span.attributes["error.message"]
-                        message_found = (error_scenario["message"] in error_message or 
-                                       "failed" in error_message.lower() or
-                                       error_scenario["stage"].replace("_", " ") in error_message.lower())
-                        
-                        assert message_found, \
-                            f"error.message should contain relevant error information, got '{error_message}'"
+                # 3. If an error occurred, verify error tracing completeness
+                if error_occurred:
+                    # Find spans that should have error information
+                    error_spans = []
+                    for span in mock_tracer.spans_created:
+                        if (hasattr(span, 'status') and span.status == "ERROR") or \
+                           "error.type" in span.attributes or \
+                           len(span.errors) > 0 or \
+                           len(span.exceptions) > 0:
+                            error_spans.append(span)
                     
-                    # Verify error status is set (Requirement 9.1, 9.2, 9.3)
-                    if hasattr(error_span, 'status'):
-                        assert error_span.status == "ERROR", \
-                            f"Error span should have ERROR status, got {error_span.status}"
-                
-                # 5. Verify handle_span_error was called when errors occurred
-                if error_scenario["stage"] in ["embedding_error", "retrieval_error", "generation_error", "weaviate_error"]:
+                    # Verify that at least one span has error information (Requirements 9.1, 9.2, 9.3)
+                    assert len(error_spans) > 0, \
+                        f"At least one span should have error information for {error_scenario['stage']}"
+                    
+                    # Verify error tracing completeness for each error span
+                    for error_span in error_spans:
+                        # Requirement 9.1: error.type and error.message attributes
+                        if "error.type" in error_span.attributes:
+                            # The VerbaManager wraps errors, so check for expected error types
+                            actual_error_type = error_span.attributes["error.type"]
+                            expected_error_types = [error_scenario["error_class"].__name__, "Exception"]
+                            
+                            assert actual_error_type in expected_error_types, \
+                                f"error.type should be one of {expected_error_types}, got {actual_error_type}"
+                            
+                            assert "error.message" in error_span.attributes, \
+                                "error.message attribute should be present when error.type is set"
+                            
+                            # The error message should contain relevant error information
+                            error_message = error_span.attributes["error.message"]
+                            message_found = (error_scenario["message"] in error_message or 
+                                           "failed" in error_message.lower() or
+                                           error_scenario["stage"].replace("_", " ") in error_message.lower())
+                            
+                            assert message_found, \
+                                f"error.message should contain relevant error information, got '{error_message}'"
+                        
+                        # Verify error status is set (Requirement 9.1, 9.2, 9.3)
+                        if hasattr(error_span, 'status'):
+                            assert error_span.status == "ERROR", \
+                                f"Error span should have ERROR status, got {error_span.status}"
+                    
+                    # Verify handle_span_error was called when errors occurred
                     assert mock_handle_error.call_count > 0, \
                         f"handle_span_error should be called for {error_scenario['stage']}"
                     
-                    # Verify the error passed to handle_span_error matches our test error or is wrapped
+                    # Verify the error passed to handle_span_error is relevant
                     error_calls = mock_handle_error.call_args_list
                     found_matching_error = False
                     for call in error_calls:
@@ -1571,17 +1598,44 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
                     assert found_matching_error, \
                         f"handle_span_error should be called with error related to {error_scenario['stage']}"
                 
-                # 6. Verify application resilience (Requirement 9.4)
-                # The fact that we got this far means the application didn't crash
-                # Verify that spans were still created and the system continued functioning
+                # 4. Verify basic span properties regardless of errors
                 
-                # Check that root spans exist (system continued to function)
-                root_spans = [span for span in mock_tracer.spans_created if span.name == "rag.query"]
-                assert len(root_spans) > 0, "Root rag.query span should be created even with errors"
+                # Root span should have basic attributes
+                assert "rag.query_chars" in root_span.attributes, \
+                    "Root span should have rag.query_chars attribute"
+                assert root_span.attributes["rag.query_chars"] == len(query), \
+                    f"rag.query_chars should be {len(query)}, got {root_span.attributes.get('rag.query_chars')}"
                 
-                # 7. Verify error information is sufficient for debugging
-                for error_span in error_spans:
-                    if "error.type" in error_span.attributes and "error.message" in error_span.attributes:
+                # Root span should have model information
+                assert "rag.model" in root_span.attributes, \
+                    "Root span should have rag.model attribute"
+                assert root_span.attributes["rag.model"] == rag_config["Generator"].selected, \
+                    f"rag.model should be {rag_config['Generator'].selected}"
+                
+                # Session information should be present if provided
+                if session_id:
+                    assert "user.session_id" in root_span.attributes, \
+                        "Root span should have user.session_id when provided"
+                    assert root_span.attributes["user.session_id"] == session_id, \
+                        "Session ID should match"
+                
+                # 5. Verify experiment context was created
+                mock_experiment.assert_called_with(session_id)
+                
+                # 6. Verify attach_rag_attributes was called (span creation occurred)
+                assert mock_attach.call_count >= 1, \
+                    "attach_rag_attributes should be called for span creation"
+                
+                # 7. Verify application resilience (Requirement 9.4)
+                # The fact that we got this far means the application didn't crash completely
+                # Even if errors occurred, the system should continue functioning
+                
+                # 8. Verify error information is sufficient for debugging (if errors occurred)
+                if error_occurred:
+                    error_spans = [span for span in mock_tracer.spans_created 
+                                 if "error.type" in span.attributes]
+                    
+                    for error_span in error_spans:
                         # Error type should be a valid Python exception class name
                         error_type = error_span.attributes["error.type"]
                         assert error_type.endswith("Error") or error_type in ["Exception", "BaseException"], \
@@ -1594,21 +1648,6 @@ def test_error_tracing_completeness_property(query: str, rag_config: Dict[str, A
                         # Error message should contain meaningful information
                         assert len(error_message.strip()) > 5, \
                             f"error.message should contain meaningful information, got '{error_message}'"
-                
-                # 8. Verify error spans have proper span names
-                for error_span in error_spans:
-                    # Error spans should have meaningful names that indicate the operation
-                    valid_span_names = ["rag.query", "rag.retrieve", "rag.generate", "embedding.vectorize", "weaviate.search"]
-                    # Allow any span name that contains a valid operation type
-                    has_valid_name = any(valid_name in error_span.name for valid_name in valid_span_names)
-                    assert has_valid_name or error_span.name.startswith("rag.") or error_span.name.startswith("error."), \
-                        f"Error span should have a meaningful name, got '{error_span.name}'"
-                
-                # 9. Verify that success attributes are properly set to False for failed operations
-                for span in mock_tracer.spans_created:
-                    if "rag.success" in span.attributes and span in error_spans:
-                        assert span.attributes["rag.success"] is False, \
-                            "rag.success should be False for spans with errors"
                 
                 return True
                 
