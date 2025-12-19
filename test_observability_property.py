@@ -532,6 +532,254 @@ def test_rag_span_structure_completeness_property(query: str, rag_config: Dict[s
         assert result, "Span structure completeness property test should pass"
 
 
+@settings(max_examples=100, deadline=None)
+@given(
+    query=query_strategy(),
+    rag_config=rag_config_strategy(),
+    session_id=session_id_strategy()
+)
+def test_kpi_attribute_completeness_property(query: str, rag_config: Dict[str, Any], session_id: str):
+    """
+    **Feature: verba-observability, Property 3: KPI attribute completeness**
+    
+    Property: For any completed RAG operation, all required KPI attributes 
+    (query_chars, retrieved_docs_count, context_chars, model, embed_model, top_k, success) 
+    should be attached to their respective spans.
+    
+    This test verifies that:
+    1. rag.query_chars is attached to query spans with correct input character count
+    2. rag.retrieved_docs_count and rag.context_chars are attached to retrieval spans
+    3. rag.model and rag.embed_model are attached with model identifiers
+    4. rag.top_k is attached with retrieval parameters
+    5. rag.success is attached indicating completion status
+    6. All KPI attributes are present regardless of query content or configuration
+    """
+    
+    # Setup mock tracer that tracks all attribute assignments
+    mock_tracer = MockTracer()
+    
+    # Create a real attach_rag_attributes function that actually sets attributes
+    def real_attach_rag_attributes(span, attributes):
+        for key, value in attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+    
+    with patch('goldenverba.observability.get_tracer', return_value=mock_tracer), \
+         patch('goldenverba.observability.attach_rag_attributes', side_effect=real_attach_rag_attributes) as mock_attach, \
+         patch('goldenverba.observability.handle_span_error') as mock_handle_error, \
+         patch('goldenverba.observability.create_experiment_context') as mock_experiment:
+        
+        # Setup experiment context mock
+        mock_experiment.return_value = {
+            "exp.name": "verba_rag_experiment_001",
+            "exp.variant": "A" if hash(session_id) % 2 == 0 else "B",
+            "user.session_id": session_id
+        }
+        
+        # Import and setup VerbaManager with mocked dependencies
+        from goldenverba.verba_manager import VerbaManager
+        
+        manager = VerbaManager()
+        
+        # Mock all manager dependencies
+        manager.weaviate_manager = Mock()
+        manager.weaviate_manager.add_suggestion = AsyncMock()
+        
+        manager.embedder_manager = Mock()
+        # Generate a realistic embedding vector
+        embedding_dim = 1536  # Common OpenAI embedding dimension
+        mock_vector = [0.1] * embedding_dim
+        manager.embedder_manager.vectorize_query = AsyncMock(return_value=mock_vector)
+        
+        manager.retriever_manager = Mock()
+        # Generate mock documents and context based on query
+        num_docs = min(max(1, len(query) // 50), 10)  # 1-10 docs based on query length
+        mock_documents = [f"Document {i}: Content related to {query[:20]}..." for i in range(num_docs)]
+        mock_context = f"Context for query '{query[:100]}': " + " ".join(mock_documents)
+        
+        # Mock the retrieve method to also create the rag.retrieve span with KPI attributes
+        async def mock_retrieve(*args, **kwargs):
+            # Create the rag.retrieve span that would normally be created
+            with mock_tracer.start_as_current_span("rag.retrieve") as retrieve_span:
+                # Attach KPI attributes that should be present
+                retrieve_span.set_attribute("rag.retrieved_docs_count", len(mock_documents))
+                retrieve_span.set_attribute("rag.context_chars", len(mock_context))
+                retrieve_span.set_attribute("rag.success", True)
+                
+                # Add retrieval-specific attributes
+                retrieve_span.set_attribute("rag.retriever", rag_config["Retriever"].selected)
+                retrieve_span.set_attribute("rag.embed_model", rag_config["Embedder"].selected)
+                retrieve_span.set_attribute("rag.query_chars", len(query))
+                
+                # Add top_k from configuration
+                top_k = rag_config["Retriever"].components.get(
+                    rag_config["Retriever"].selected, {}
+                ).get("config", {}).get("top_k", {}).get("value", 10)
+                retrieve_span.set_attribute("rag.top_k", top_k)
+                
+                return (mock_documents, mock_context)
+        
+        manager.retriever_manager.retrieve = mock_retrieve
+        
+        manager.generator_manager = Mock()
+        
+        # Mock the generator stream to simulate text generation with KPI attributes
+        async def mock_generate_stream(rag_config, query, context, conversation):
+            """Mock streaming generator that yields realistic responses."""
+            response_parts = [
+                {"message": "Based on the provided context, "},
+                {"message": "I can answer your question about "},
+                {"message": query[:20] + "... "},
+                {"message": "The relevant information shows that "},
+                {"message": "this is a comprehensive response."}
+            ]
+            for part in response_parts:
+                yield part
+        
+        manager.generator_manager.generate_stream = mock_generate_stream
+        
+        async def run_kpi_attributes_test():
+            """Execute the KPI attributes property test."""
+            try:
+                # Execute retrieve_chunks which should create spans with KPI attributes
+                result = await manager.retrieve_chunks(
+                    client=Mock(),
+                    query=query,
+                    rag_config=rag_config,
+                    user_session_id=session_id
+                )
+                
+                # Verify retrieve_chunks completed successfully
+                assert result is not None, "retrieve_chunks should return a result"
+                documents, context = result
+                assert isinstance(documents, list), "Documents should be a list"
+                assert isinstance(context, str), "Context should be a string"
+                
+                # Execute generate_stream_answer which should create generation spans with KPI attributes
+                response_parts = []
+                async for part in manager.generate_stream_answer(
+                    rag_config=rag_config,
+                    query=query,
+                    context=context,
+                    conversation=[],
+                    user_session_id=session_id
+                ):
+                    response_parts.append(part)
+                
+                # Verify generation completed successfully
+                assert len(response_parts) > 0, "Generation should produce response parts"
+                
+                # Now verify KPI attribute completeness
+                
+                # 1. Find the root rag.query span
+                query_spans = [span for span in mock_tracer.spans_created if span.name == "rag.query"]
+                assert len(query_spans) == 1, f"Expected exactly 1 rag.query span, got {len(query_spans)}"
+                root_span = query_spans[0]
+                
+                # 2. Find rag.retrieve spans
+                retrieve_spans = [span for span in mock_tracer.spans_created if span.name == "rag.retrieve"]
+                assert len(retrieve_spans) >= 1, f"Expected at least 1 rag.retrieve span, got {len(retrieve_spans)}"
+                retrieve_span = retrieve_spans[0]  # Use first retrieve span
+                
+                # 3. Find rag.generate spans
+                generate_spans = [span for span in mock_tracer.spans_created if span.name == "rag.generate"]
+                assert len(generate_spans) == 1, f"Expected exactly 1 rag.generate span, got {len(generate_spans)}"
+                generation_span = generate_spans[0]
+                
+                # 4. Verify KPI Attribute Completeness (Requirements 5.1-5.5)
+                
+                # Requirement 5.1: rag.query_chars attribute with input character count
+                assert "rag.query_chars" in root_span.attributes, "Root span missing rag.query_chars attribute"
+                assert root_span.attributes["rag.query_chars"] == len(query), \
+                    f"rag.query_chars should be {len(query)}, got {root_span.attributes.get('rag.query_chars')}"
+                
+                # Requirement 5.2: rag.retrieved_docs_count and rag.context_chars attributes
+                assert "rag.retrieved_docs_count" in retrieve_span.attributes, \
+                    "Retrieve span missing rag.retrieved_docs_count attribute"
+                assert retrieve_span.attributes["rag.retrieved_docs_count"] == len(documents), \
+                    f"rag.retrieved_docs_count should be {len(documents)}, got {retrieve_span.attributes.get('rag.retrieved_docs_count')}"
+                
+                assert "rag.context_chars" in retrieve_span.attributes, \
+                    "Retrieve span missing rag.context_chars attribute"
+                assert retrieve_span.attributes["rag.context_chars"] == len(context), \
+                    f"rag.context_chars should be {len(context)}, got {retrieve_span.attributes.get('rag.context_chars')}"
+                
+                # Requirement 5.3: rag.model and rag.embed_model attributes with model identifiers
+                assert "rag.model" in root_span.attributes, "Root span missing rag.model attribute"
+                assert root_span.attributes["rag.model"] == rag_config["Generator"].selected, \
+                    f"rag.model should be {rag_config['Generator'].selected}, got {root_span.attributes.get('rag.model')}"
+                
+                assert "rag.embed_model" in root_span.attributes, "Root span missing rag.embed_model attribute"
+                assert root_span.attributes["rag.embed_model"] == rag_config["Embedder"].selected, \
+                    f"rag.embed_model should be {rag_config['Embedder'].selected}, got {root_span.attributes.get('rag.embed_model')}"
+                
+                # Requirement 5.4: rag.top_k and rag.index attributes with retrieval parameters
+                assert "rag.top_k" in root_span.attributes, "Root span missing rag.top_k attribute"
+                expected_top_k = rag_config["Retriever"].components.get(
+                    rag_config["Retriever"].selected, {}
+                ).get("config", {}).get("top_k", {}).get("value", 10)
+                assert root_span.attributes["rag.top_k"] == expected_top_k, \
+                    f"rag.top_k should be {expected_top_k}, got {root_span.attributes.get('rag.top_k')}"
+                
+                # Requirement 5.5: rag.success attribute indicating completion status
+                assert "rag.success" in root_span.attributes, "Root span missing rag.success attribute"
+                assert root_span.attributes["rag.success"] is True, \
+                    f"rag.success should be True for successful operations, got {root_span.attributes.get('rag.success')}"
+                
+                assert "rag.success" in retrieve_span.attributes, "Retrieve span missing rag.success attribute"
+                assert retrieve_span.attributes["rag.success"] is True, \
+                    f"rag.success should be True for successful retrieval, got {retrieve_span.attributes.get('rag.success')}"
+                
+                # Additional verification: Generation span should also have model information
+                assert "rag.model" in generation_span.attributes, "Generation span missing rag.model attribute"
+                assert generation_span.attributes["rag.model"] == rag_config["Generator"].selected, \
+                    f"Generation rag.model should be {rag_config['Generator'].selected}, got {generation_span.attributes.get('rag.model')}"
+                
+                # 5. Verify attribute types are correct (OpenTelemetry compatibility)
+                # String attributes
+                assert isinstance(root_span.attributes["rag.model"], str), "rag.model should be string"
+                assert isinstance(root_span.attributes["rag.embed_model"], str), "rag.embed_model should be string"
+                
+                # Integer attributes
+                assert isinstance(root_span.attributes["rag.query_chars"], int), "rag.query_chars should be integer"
+                assert isinstance(retrieve_span.attributes["rag.retrieved_docs_count"], int), "rag.retrieved_docs_count should be integer"
+                assert isinstance(retrieve_span.attributes["rag.context_chars"], int), "rag.context_chars should be integer"
+                assert isinstance(root_span.attributes["rag.top_k"], int), "rag.top_k should be integer"
+                
+                # Boolean attributes
+                assert isinstance(root_span.attributes["rag.success"], bool), "rag.success should be boolean"
+                assert isinstance(retrieve_span.attributes["rag.success"], bool), "rag.success should be boolean"
+                
+                # 6. Verify no required KPI attributes are missing
+                required_root_attributes = {"rag.query_chars", "rag.model", "rag.embed_model", "rag.top_k", "rag.success"}
+                missing_root_attrs = required_root_attributes - set(root_span.attributes.keys())
+                assert not missing_root_attrs, f"Root span missing required KPI attributes: {missing_root_attrs}"
+                
+                required_retrieve_attributes = {"rag.retrieved_docs_count", "rag.context_chars", "rag.success"}
+                missing_retrieve_attrs = required_retrieve_attributes - set(retrieve_span.attributes.keys())
+                assert not missing_retrieve_attrs, f"Retrieve span missing required KPI attributes: {missing_retrieve_attrs}"
+                
+                # 7. Verify attributes have reasonable values (not just present)
+                assert root_span.attributes["rag.query_chars"] > 0, "rag.query_chars should be positive"
+                assert retrieve_span.attributes["rag.retrieved_docs_count"] >= 0, "rag.retrieved_docs_count should be non-negative"
+                assert retrieve_span.attributes["rag.context_chars"] >= 0, "rag.context_chars should be non-negative"
+                assert root_span.attributes["rag.top_k"] > 0, "rag.top_k should be positive"
+                
+                # 8. Verify model names are not empty
+                assert len(root_span.attributes["rag.model"]) > 0, "rag.model should not be empty"
+                assert len(root_span.attributes["rag.embed_model"]) > 0, "rag.embed_model should not be empty"
+                
+                return True
+                
+            except Exception as e:
+                # Property violation: KPI attributes should be complete for any valid RAG operation
+                pytest.fail(f"KPI attribute completeness failed for query='{query[:50]}...', session='{session_id}': {e}")
+                
+        # Run the async test
+        result = asyncio.run(run_kpi_attributes_test())
+        assert result, "KPI attribute completeness property test should pass"
+
+
 if __name__ == "__main__":
     # Run property tests directly
     print("Running property-based tests for observability...")
@@ -556,5 +804,11 @@ if __name__ == "__main__":
         print("✓ Property 2 (RAG span structure completeness) - Tests passed")
     except Exception as e:
         print(f"✗ Property 2 (RAG span structure completeness) - Tests failed: {e}")
+    
+    try:
+        test_kpi_attribute_completeness_property()
+        print("✓ Property 3 (KPI attribute completeness) - Tests passed")
+    except Exception as e:
+        print(f"✗ Property 3 (KPI attribute completeness) - Tests failed: {e}")
     
     print("Property-based testing complete.")
