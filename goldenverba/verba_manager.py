@@ -734,8 +734,8 @@ class VerbaManager:
                     "rag.model": rag_config["Generator"].selected,
                     "rag.embed_model": rag_config["Embedder"].selected,
                     "rag.top_k": rag_config["Retriever"].components.get(
-                        rag_config["Retriever"].selected, {}
-                    ).get("config", {}).get("top_k", {}).get("value", 10),
+                        rag_config["Retriever"].selected
+                    ).config.get("top_k", {}).get("value", 10) if rag_config["Retriever"].components.get(rag_config["Retriever"].selected) else 10,
                     "rag.index": "verba_documents"
                 }
                 
@@ -747,7 +747,7 @@ class VerbaManager:
                     # Add configuration version attributes
                     query_attributes.update({
                         "config.prompt_version": "v3.2",  # Default version
-                        "config.reranker_version": rag_config.get("Retriever", {}).get("selected", "default")
+                        "config.reranker_version": rag_config["Retriever"].selected if "Retriever" in rag_config else "default"
                     })
                 
                 attach_rag_attributes(span, query_attributes)
@@ -842,13 +842,14 @@ class VerbaManager:
                     # Add configuration version attributes
                     generation_attributes.update({
                         "config.prompt_version": "v3.2",  # Default version
-                        "config.reranker_version": rag_config.get("Retriever", {}).get("selected", "default")
+                        "config.reranker_version": rag_config["Retriever"].selected if "Retriever" in rag_config else "default"
                     })
                 
                 # Add model-specific configuration if available
-                generator_config = rag_config["Generator"].components.get(
-                    rag_config["Generator"].selected, {}
-                ).get("config", {})
+                generator_component = rag_config["Generator"].components.get(
+                    rag_config["Generator"].selected
+                )
+                generator_config = generator_component.config if generator_component else {}
                 
                 if "temperature" in generator_config:
                     generation_attributes["llm.temperature"] = generator_config["temperature"].get("value", 0.7)
